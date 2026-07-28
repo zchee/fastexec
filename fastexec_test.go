@@ -171,8 +171,8 @@ func TestExitCode(t *testing.T) {
 					t.Fatalf("error %v (%T) is not *ExitError", err, err)
 				}
 			}
-			if c.ProcessState == nil {
-				t.Fatal("ProcessState is nil after Run")
+			if c.ProcessState.Pid() == 0 {
+				t.Fatal("ProcessState not populated after Run")
 			}
 			if got := c.ProcessState.ExitCode(); got != tt.wantCode {
 				t.Fatalf("ExitCode() = %d, want %d", got, tt.wantCode)
@@ -220,6 +220,10 @@ func TestEnv(t *testing.T) {
 
 func TestInheritedEnv(t *testing.T) {
 	t.Setenv("FASTEXEC_INHERIT_TEST", "from-parent")
+	// The nil-Env snapshot is cached process-wide; drop any snapshot
+	// taken before Setenv and leave a clean slate behind.
+	InvalidateEnv()
+	t.Cleanup(InvalidateEnv)
 
 	out, err := Command("sh", "-c", "printf '%s' \"$FASTEXEC_INHERIT_TEST\"").Output()
 	if err != nil {
@@ -328,8 +332,8 @@ func TestContextCancelKillsProcess(t *testing.T) {
 	if elapsed > 10*time.Second {
 		t.Fatalf("process was not killed promptly, Wait took %v", elapsed)
 	}
-	if c.ProcessState == nil {
-		t.Fatal("ProcessState is nil after Wait")
+	if c.ProcessState.Pid() == 0 {
+		t.Fatal("ProcessState not populated after Wait")
 	}
 	if got := c.ProcessState.Sys().Signal(); got != syscall.SIGKILL {
 		t.Fatalf("termination signal = %v, want SIGKILL", got)
@@ -403,6 +407,42 @@ func TestArgvZero(t *testing.T) {
 	}
 	if diff := gocmp.Diff("custom-argv0", string(out)); diff != "" {
 		t.Fatalf("argv[0] mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestReset(t *testing.T) {
+	t.Parallel()
+
+	c := Command("sh", "-c", "exit 7")
+	c.Env = []string{}
+	err := c.Run()
+	var first *ExitError
+	if !errors.As(err, &first) {
+		t.Fatalf("first Run() = %v (%T), want *ExitError", err, err)
+	}
+
+	// The same Cmd respawns after Reset, and the prior run's ExitError
+	// keeps its own copy of the process state.
+	c.Reset()
+	if c.ProcessState.Pid() != 0 {
+		t.Fatal("Reset did not clear ProcessState")
+	}
+	err = c.Run()
+	var second *ExitError
+	if !errors.As(err, &second) {
+		t.Fatalf("second Run() = %v (%T), want *ExitError", err, err)
+	}
+	if first.Pid() == second.Pid() {
+		t.Fatalf("both runs report pid %d, want distinct processes", first.Pid())
+	}
+	if got := first.ExitCode(); got != 7 {
+		t.Fatalf("first ExitError.ExitCode() after Reset = %d, want 7", got)
+	}
+
+	// The state machine still rejects out-of-order calls after Reset.
+	c.Reset()
+	if err := c.Wait(); err == nil {
+		t.Fatal("Wait() before Start() should fail after Reset")
 	}
 }
 

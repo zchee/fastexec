@@ -50,6 +50,19 @@ func BenchmarkRunFastexec(b *testing.B) {
 	}
 }
 
+func BenchmarkRunFastexecReset(b *testing.B) {
+	path := benchTarget(b)
+	c := Command(path)
+	c.Env = benchEnv
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := c.Run(); err != nil {
+			b.Fatal(err)
+		}
+		c.Reset()
+	}
+}
+
 func BenchmarkRunOsExec(b *testing.B) {
 	path := benchTarget(b)
 	b.ReportAllocs()

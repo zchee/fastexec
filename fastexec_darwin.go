@@ -167,24 +167,24 @@ func (st *spawnState) destroyAttrOnErr(e unix.Errno) {
 	st.attrErr = e
 }
 
-// startProcess spawns c.Path via posix_spawn(2) and returns the resulting
-// process handle. files holds the resolved stdin/stdout/stderr files.
+// startProcess spawns c.Path via posix_spawn(2), filling in c.Process
+// on success. files holds the resolved stdin/stdout/stderr files.
 //
 // POSIX_SPAWN_CLOEXEC_DEFAULT guarantees that only the three dup2'd stdio
 // descriptors survive into the child, so no descriptor can leak
 // regardless of concurrent descriptor creation elsewhere in the process,
 // and [syscall.ForkLock] is never taken.
-func startProcess(c *Cmd, files [3]*os.File) (*Process, error) {
+func startProcess(c *Cmd, files [3]*os.File) error {
 	st := spawnPool.Get().(*spawnState)
 	defer spawnPool.Put(st)
 
 	env := c.Env
 	if env == nil {
-		env = os.Environ()
+		env = defaultEnv()
 	}
 	pathp, dirp, argvp, envp, err := st.cs.build(c.Path, c.Dir, c.argv(), env)
 	if err != nil {
-		return nil, &Error{Name: c.Path, Err: err}
+		return &Error{Name: c.Path, Err: err}
 	}
 
 	// Stdio sources already at fd >= 3 (the /dev/null singleton, os.Pipe
@@ -209,7 +209,7 @@ func startProcess(c *Cmd, files [3]*os.File) (*Process, error) {
 					unix.Close(d)
 				}
 			}
-			return nil, &Error{Name: c.Path, Err: os.NewSyscallError("fcntl", ferr)}
+			return &Error{Name: c.Path, Err: os.NewSyscallError("fcntl", ferr)}
 		}
 		highs[i] = h
 		dupped[i] = true
@@ -225,14 +225,14 @@ func startProcess(c *Cmd, files [3]*os.File) (*Process, error) {
 	// The pooled attribute already carries SETSIGDEF, SETSIGMASK, and
 	// CLOEXEC_DEFAULT; only the per-spawn file actions are built here.
 	if st.attrErr != 0 {
-		return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawnattr_init", st.attrErr)}
+		return &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawnattr_init", st.attrErr)}
 	}
 
 	st.facts = 0
 	if e := libcCallRaw(
 		libc_posix_spawn_file_actions_init_trampoline_addr,
 		uintptr(unsafe.Pointer(&st.facts)), 0, 0, 0, 0, 0); e != 0 {
-		return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_init", e)}
+		return &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_init", e)}
 	}
 	defer libcCallRaw(
 		libc_posix_spawn_file_actions_destroy_trampoline_addr,
@@ -242,14 +242,14 @@ func startProcess(c *Cmd, files [3]*os.File) (*Process, error) {
 		if e := libcCallRaw(
 			libc_posix_spawn_file_actions_adddup2_trampoline_addr,
 			uintptr(unsafe.Pointer(&st.facts)), uintptr(h), uintptr(i), 0, 0, 0); e != 0 {
-			return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_adddup2", e)}
+			return &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_adddup2", e)}
 		}
 	}
 	if dirp != nil {
 		if e := libcCallRaw(
 			libc_posix_spawn_file_actions_addchdir_np_trampoline_addr,
 			uintptr(unsafe.Pointer(&st.facts)), uintptr(unsafe.Pointer(dirp)), 0, 0, 0, 0); e != 0 {
-			return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_addchdir_np", e)}
+			return &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_addchdir_np", e)}
 		}
 	}
 
@@ -263,9 +263,10 @@ func startProcess(c *Cmd, files [3]*os.File) (*Process, error) {
 	runtime.KeepAlive(st)
 	runtime.KeepAlive(files)
 	if e != 0 {
-		return nil, &Error{Name: c.Path, Err: e}
+		return &Error{Name: c.Path, Err: e}
 	}
-	return &Process{Pid: int(st.pid)}, nil
+	c.Process.Pid = int(st.pid)
+	return nil
 }
 
 // Process represents a running process created by [Cmd.Start].
@@ -280,23 +281,20 @@ type Process struct {
 	done  bool
 }
 
-// wait blocks until the process exits and returns its final state.
-func (p *Process) wait() (*ProcessState, error) {
-	ps := &ProcessState{pid: p.Pid}
+// wait blocks until the process exits, storing its final state into ps.
+func (p *Process) wait(ps *ProcessState) error {
+	ps.pid = p.Pid
 	for {
-		wpid, err := unix.Wait4(p.Pid, &ps.status, 0, &ps.rusage)
-		if err == nil {
-			_ = wpid
+		if _, err := unix.Wait4(p.Pid, &ps.status, 0, &ps.rusage); err == nil {
 			break
-		}
-		if err != unix.EINTR {
-			return nil, os.NewSyscallError("wait4", err)
+		} else if err != unix.EINTR {
+			return os.NewSyscallError("wait4", err)
 		}
 	}
 	p.sigMu.Lock()
 	p.done = true
 	p.sigMu.Unlock()
-	return ps, nil
+	return nil
 }
 
 // Signal sends sig to the process. It returns [ErrProcessDone] if the
@@ -319,6 +317,13 @@ func (p *Process) Signal(sig unix.Signal) error {
 // Kill causes the process to exit immediately ([unix.SIGKILL]).
 func (p *Process) Kill() error {
 	return p.Signal(unix.SIGKILL)
+}
+
+// reset returns the Process to its pre-start state for Cmd reuse; the
+// embedded mutex is retained.
+func (p *Process) reset() {
+	p.Pid = 0
+	p.done = false
 }
 
 // release is a no-op on Darwin; there is no handle beyond the PID.

@@ -161,37 +161,37 @@ var errnoViaPipe = sync.OnceValue(func() bool {
 		return true
 	}
 	probe := &Cmd{Path: "/dev/null/fastexec-probe", Args: []string{"fastexec-probe"}, Env: []string{}}
-	p, perr := startProcess1(probe, [3]*os.File{null, null, null}, false)
-	if perr != nil {
+	if perr := startProcess1(probe, [3]*os.File{null, null, null}, false); perr != nil {
 		// The child's [unix.ENOTDIR] was observed: shared memory works.
 		return false
 	}
 	// The spawn "succeeded" even though the path cannot exist: the
 	// child's write was lost. Reap the probe child and switch modes.
-	p.wait() //nolint:errcheck // probe child is discarded either way
-	p.release()
+	var ps ProcessState
+	probe.Process.wait(&ps) //nolint:errcheck // probe child is discarded either way
+	probe.Process.release()
 	return true
 })
 
-// startProcess spawns c.Path and returns the resulting process handle.
-// files holds the resolved stdin/stdout/stderr files.
-func startProcess(c *Cmd, files [3]*os.File) (*Process, error) {
+// startProcess spawns c.Path, filling in c.Process on success. files
+// holds the resolved stdin/stdout/stderr files.
+func startProcess(c *Cmd, files [3]*os.File) error {
 	return startProcess1(c, files, errnoViaPipe())
 }
 
 // startProcess1 implements startProcess with an explicit error-reporting
 // mode so the one-time probe can bypass the mode decision.
-func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) (*Process, error) {
+func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) error {
 	st := spawnPool.Get().(*spawnState)
 	defer spawnPool.Put(st)
 
 	env := c.Env
 	if env == nil {
-		env = os.Environ()
+		env = defaultEnv()
 	}
 	pathp, dirp, argvp, envp, err := st.cs.build(c.Path, c.Dir, c.argv(), env)
 	if err != nil {
-		return nil, &Error{Name: c.Path, Err: err}
+		return &Error{Name: c.Path, Err: err}
 	}
 
 	// Stdio sources already at fd >= 3 (the /dev/null singleton, os.Pipe
@@ -217,7 +217,7 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) (*Process, error) {
 					unix.Close(d)
 				}
 			}
-			return nil, &Error{Name: c.Path, Err: os.NewSyscallError("fcntl", ferr)}
+			return &Error{Name: c.Path, Err: os.NewSyscallError("fcntl", ferr)}
 		}
 		highs[i] = h
 		dupped[i] = true
@@ -238,7 +238,7 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) (*Process, error) {
 	if usePipe {
 		var pfd [2]int
 		if perr := unix.Pipe2(pfd[:], unix.O_CLOEXEC); perr != nil {
-			return nil, &Error{Name: c.Path, Err: os.NewSyscallError("pipe2", perr)}
+			return &Error{Name: c.Path, Err: os.NewSyscallError("pipe2", perr)}
 		}
 		pipeR, pipeW = pfd[0], pfd[1]
 		if pipeW < 3 {
@@ -246,7 +246,7 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) (*Process, error) {
 			unix.Close(pipeW)
 			if perr != nil {
 				unix.Close(pipeR)
-				return nil, &Error{Name: c.Path, Err: os.NewSyscallError("fcntl", perr)}
+				return &Error{Name: c.Path, Err: os.NewSyscallError("fcntl", perr)}
 			}
 			pipeW = nfd
 		}
@@ -270,9 +270,9 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) (*Process, error) {
 			unix.Close(pipeW)
 		}
 		if errno == unix.ENOSYS || errno == unix.EINVAL {
-			return nil, &Error{Name: c.Path, Err: errors.New("clone3/clone(CLONE_PIDFD) unavailable: fastexec requires Linux 5.4+ and a seccomp policy permitting them")}
+			return &Error{Name: c.Path, Err: errors.New("clone3/clone(CLONE_PIDFD) unavailable: fastexec requires Linux 5.4+ and a seccomp policy permitting them")}
 		}
-		return nil, &Error{Name: c.Path, Err: os.NewSyscallError("clone", errno)}
+		return &Error{Name: c.Path, Err: os.NewSyscallError("clone", errno)}
 	}
 
 	if usePipe {
@@ -282,16 +282,18 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) (*Process, error) {
 		if childErrno != 0 {
 			reapAbandoned(int(st.pidfd))
 			unix.Close(int(st.pidfd))
-			return nil, &Error{Name: c.Path, Err: childErrno}
+			return &Error{Name: c.Path, Err: childErrno}
 		}
 	} else if st.child.errno != 0 {
 		// The child failed before or at execve and has already exited;
 		// reap it so no zombie is left behind.
 		reapAbandoned(int(st.pidfd))
 		unix.Close(int(st.pidfd))
-		return nil, &Error{Name: c.Path, Err: unix.Errno(st.child.errno)}
+		return &Error{Name: c.Path, Err: unix.Errno(st.child.errno)}
 	}
-	return &Process{Pid: int(pid), pidfd: int(st.pidfd)}, nil
+	c.Process.Pid = int(pid)
+	c.Process.pidfd = int(st.pidfd)
+	return nil
 }
 
 // rawSpawn issues the clone3(2)/clone(2) call described by st.child and
@@ -485,11 +487,10 @@ func (si *siginfo) waitStatus() unix.WaitStatus {
 	}
 }
 
-// wait blocks until the process exits and returns its final state. It
-// waits on the pidfd, so it never races with PID reuse.
-func (p *Process) wait() (*ProcessState, error) {
+// wait blocks until the process exits, storing its final state into
+// ps. It waits on the pidfd, so it never races with PID reuse.
+func (p *Process) wait(ps *ProcessState) error {
 	var si siginfo
-	ps := &ProcessState{}
 	for {
 		_, _, e := unix.Syscall6(unix.SYS_WAITID, unix.P_PIDFD, uintptr(p.pidfd),
 			uintptr(unsafe.Pointer(&si)), uintptr(unix.WEXITED),
@@ -498,12 +499,12 @@ func (p *Process) wait() (*ProcessState, error) {
 			break
 		}
 		if e != unix.EINTR {
-			return nil, os.NewSyscallError("waitid", e)
+			return os.NewSyscallError("waitid", e)
 		}
 	}
 	ps.pid = int(si.pid)
 	ps.status = si.waitStatus()
-	return ps, nil
+	return nil
 }
 
 // Signal sends sig to the process through its pidfd.
@@ -525,6 +526,14 @@ func (p *Process) Signal(sig unix.Signal) error {
 // Kill causes the process to exit immediately ([unix.SIGKILL]).
 func (p *Process) Kill() error {
 	return p.Signal(unix.SIGKILL)
+}
+
+// reset returns the Process to its pre-start state for Cmd reuse; the
+// embedded mutex is retained.
+func (p *Process) reset() {
+	p.Pid = 0
+	p.pidfd = -1
+	p.released = false
 }
 
 // release closes the pidfd. It must only be called after wait has reaped

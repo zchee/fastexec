@@ -106,9 +106,11 @@ func (e *Error) Error() string {
 // Unwrap returns the underlying error.
 func (e *Error) Unwrap() error { return e.Err }
 
-// ExitError reports an unsuccessful exit by a command.
+// ExitError reports an unsuccessful exit by a command. It embeds its
+// own copy of the final [ProcessState], so it remains valid after the
+// originating [Cmd] is reset or reused.
 type ExitError struct {
-	*ProcessState
+	ProcessState
 
 	// Stderr holds the standard error output of the command if it was
 	// captured by [Cmd.Output] and the command's Stderr was nil.
@@ -199,8 +201,10 @@ func itoa(v int) string {
 
 // Cmd represents an external command being prepared or run.
 //
-// A Cmd cannot be reused after calling its Run, Start, Output, or
-// CombinedOutput methods.
+// After Run, Start, Output, or CombinedOutput has been called, a Cmd
+// must be returned to its pre-start state with [Cmd.Reset] before it
+// can spawn again. A Cmd must not be copied after first use: it
+// embeds the process handle and its synchronization state by value.
 type Cmd struct {
 	// Path is the path of the command to run.
 	//
@@ -230,12 +234,16 @@ type Cmd struct {
 	Stdout *os.File
 	Stderr *os.File
 
-	// Process is the underlying process, once started.
-	Process *Process
+	// Process is the underlying process, valid once Start has
+	// succeeded. It is embedded by value so steady-state spawning
+	// allocates nothing; take its address to call its methods
+	// concurrently.
+	Process Process
 
-	// ProcessState contains information about an exited process,
-	// populated by Wait.
-	ProcessState *ProcessState
+	// ProcessState contains information about the exited process,
+	// populated by Wait (its Pid method reports zero until then). It is
+	// embedded by value; [ExitError] carries its own copy.
+	ProcessState ProcessState
 
 	ctx         context.Context
 	lookPathErr error
@@ -310,6 +318,31 @@ var devNull = sync.OnceValues(func() (*os.File, error) {
 	return os.OpenFile(os.DevNull, os.O_RDWR, 0)
 })
 
+// envCache holds the snapshot of the process environment used for
+// commands whose Env is nil, so steady-state nil-Env spawning does not
+// re-copy the environment on every spawn.
+var envCache atomic.Pointer[[]string]
+
+// defaultEnv returns the cached copy of the current environment,
+// snapshotting os.Environ on first use.
+func defaultEnv() []string {
+	if p := envCache.Load(); p != nil {
+		return *p
+	}
+	env := os.Environ()
+	envCache.Store(&env)
+	return env
+}
+
+// InvalidateEnv discards the environment snapshot used for commands
+// with a nil Env. A caller that mutates the process environment
+// (os.Setenv, os.Unsetenv, os.Clearenv) after a spawn has occurred
+// must call InvalidateEnv for later nil-Env commands to observe the
+// change; explicit Env slices are unaffected.
+func InvalidateEnv() {
+	envCache.Store(nil)
+}
+
 // Start starts the specified command but does not wait for it to complete.
 //
 // After a successful call to Start the [Cmd.Wait] method must be called in
@@ -340,11 +373,9 @@ func (c *Cmd) Start() error {
 		}
 	}
 
-	p, err := startProcess(c, files)
-	if err != nil {
+	if err := startProcess(c, files); err != nil {
 		return err
 	}
-	c.Process = p
 
 	if c.ctx != nil && c.ctx.Done() != nil {
 		c.waitDone = make(chan struct{})
@@ -354,7 +385,7 @@ func (c *Cmd) Start() error {
 			select {
 			case <-c.ctx.Done():
 				c.ctxKill.Store(true)
-				_ = p.Kill()
+				_ = c.Process.Kill()
 			case <-c.waitDone:
 			}
 		}()
@@ -377,7 +408,7 @@ func (c *Cmd) Wait() error {
 	}
 	c.finished = true
 
-	ps, err := c.Process.wait()
+	err := c.Process.wait(&c.ProcessState)
 	if c.waitDone != nil {
 		close(c.waitDone)
 		<-c.watcherDone
@@ -386,17 +417,37 @@ func (c *Cmd) Wait() error {
 	if err != nil {
 		return err
 	}
-	c.ProcessState = ps
 
 	if c.ctxKill.Load() {
 		if ctxErr := c.ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
 	}
-	if !ps.Success() {
-		return &ExitError{ProcessState: ps}
+	if !c.ProcessState.Success() {
+		return &ExitError{ProcessState: c.ProcessState}
 	}
 	return nil
+}
+
+// Reset returns c to its pre-start state so the same Cmd can spawn
+// again, keeping the command configuration (Path, Args, Env, Dir,
+// stdio, context) and the marshaling state. Together with a preset Env
+// this makes repeated Run loops allocation-free.
+//
+// Reset must not be called while a process started from c is still
+// running. An [ExitError] returned by a previous run carries its own
+// copy of the process state and stays valid across Reset.
+func (c *Cmd) Reset() {
+	if c.started && !c.finished && c.Process.Pid != 0 {
+		panic("fastexec: Reset called on a running Cmd")
+	}
+	c.started = false
+	c.finished = false
+	c.waitDone = nil
+	c.watcherDone = nil
+	c.ctxKill.Store(false)
+	c.Process.reset()
+	c.ProcessState = ProcessState{}
 }
 
 // Run starts the specified command and waits for it to complete.
