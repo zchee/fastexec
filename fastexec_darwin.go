@@ -113,24 +113,38 @@ func startProcess(c *Cmd, files [3]*os.File) (*Process, error) {
 		return nil, &Error{Name: c.Path, Err: err}
 	}
 
-	// Duplicate every stdio source to a fresh descriptor >= 3 with
-	// O_CLOEXEC set atomically, making the dup2 file actions immune to
-	// source/target overlap (for example when the caller passes
-	// [os.Stdout] as the child's stderr).
+	// Stdio sources already at fd >= 3 (the /dev/null singleton, os.Pipe
+	// ends, any normal file) feed the dup2 file actions as-is: with every
+	// source above the target range 0..2 the actions cannot collide, and
+	// POSIX_SPAWN_CLOEXEC_DEFAULT still closes everything that was not
+	// explicitly mapped. Only sources at fds 0-2 (a caller passing
+	// [os.Stdin] et al) are duplicated up to >= 3 with O_CLOEXEC set
+	// atomically, keeping the actions collision-free.
 	var highs [3]int
+	var dupped [3]bool
 	for i, f := range files {
-		h, ferr := unix.FcntlInt(f.Fd(), unix.F_DUPFD_CLOEXEC, 3)
+		fd := f.Fd()
+		if fd >= 3 {
+			highs[i] = int(fd)
+			continue
+		}
+		h, ferr := unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 3)
 		if ferr != nil {
-			for _, d := range highs[:i] {
-				unix.Close(d)
+			for j, d := range highs[:i] {
+				if dupped[j] {
+					unix.Close(d)
+				}
 			}
 			return nil, &Error{Name: c.Path, Err: os.NewSyscallError("fcntl", ferr)}
 		}
 		highs[i] = h
+		dupped[i] = true
 	}
 	defer func() {
-		for _, d := range highs {
-			unix.Close(d)
+		for i, d := range highs {
+			if dupped[i] {
+				unix.Close(d)
+			}
 		}
 	}()
 
