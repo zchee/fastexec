@@ -27,11 +27,17 @@
 //     CLONE_VFORK|CLONE_VM, so the parent's page tables are never copied
 //     regardless of the parent's heap size, and CLONE_PIDFD, so cancellation
 //     and signaling use pidfd_send_signal(2) and can never hit a recycled
-//     PID. The child runs entirely in hand-written assembly on a private
-//     stack until execve(2), and syscall.ForkLock is not taken: file
-//     descriptors are managed exclusively with atomic O_CLOEXEC operations
-//     (F_DUPFD_CLOEXEC), so spawn throughput scales linearly with CPU
-//     count. Requires Linux 5.4+ (clone3 and waitid P_PIDFD).
+//     PID. CLONE_CLEAR_SIGHAND (Linux 5.5+) resets every signal
+//     disposition inside the child atomically, so no Go signal handler
+//     can run in the shared address space and the fast path needs no
+//     signal masking or thread pinning at all (older kernels and the
+//     clone(2) seccomp fallback transparently latch a mask-and-restore
+//     fallback). The child runs entirely in hand-written assembly on a
+//     private stack until execve(2), and syscall.ForkLock is not taken:
+//     stdio sources already above the exec target range are handed to
+//     the child as-is, so a steady-state spawn costs the parent three
+//     system calls (clone3, waitid, close). Requires Linux 5.4+ (clone3
+//     and waitid P_PIDFD).
 //
 //   - Darwin: processes are created with posix_spawn(2), the only
 //     fork-safe primitive Apple supports for multithreaded programs; the
@@ -39,14 +45,19 @@
 //     handler deadlocks and copy-on-write stalls are avoided entirely.
 //     posix_spawn is reached through a direct libSystem call (the same
 //     mechanism the Go runtime itself uses), not cgo, so there is no cgo
-//     call overhead. POSIX_SPAWN_CLOEXEC_DEFAULT guarantees that no file
-//     descriptor other than the requested stdio descriptors leaks into the
-//     child, again without [syscall.ForkLock].
+//     call overhead. The spawn attributes (POSIX_SPAWN_SETSIGDEF,
+//     SETSIGMASK, CLOEXEC_DEFAULT) are initialized once per pooled spawn
+//     state rather than per spawn, and CLOEXEC_DEFAULT guarantees that no
+//     file descriptor other than the requested stdio descriptors leaks
+//     into the child, again without [syscall.ForkLock]. A [Spec] with
+//     all-nil stdio also freezes its file actions, reducing a spawn to a
+//     single posix_spawn libc call plus the wait4.
 //
 // On both platforms argv, envp, and auxiliary strings are marshaled into a
 // pooled, reusable arena as NUL-terminated C strings referenced by raw
 // pointers, so steady-state spawning performs no per-string heap
-// allocations.
+// allocations. A [Cmd] respawned through [Cmd.Reset] with a preset Env,
+// and [Spec.Run] always, perform zero heap allocations per spawn.
 //
 // # Differences from os/exec
 //
@@ -58,15 +69,24 @@
 //     [os.Pipe] for streaming; [Cmd.Output] and [Cmd.CombinedOutput] do this
 //     internally.
 //   - Environment entries are passed to the kernel as-is: duplicates are
-//     not deduplicated. If Env is nil the current environment is used
-//     (which allocates); reuse a cached Env slice for zero-allocation
-//     spawning.
+//     not deduplicated. If Env is nil, a snapshot of the current
+//     environment is taken once and cached process-wide: a caller that
+//     mutates the environment (os.Setenv et al) after a spawn has
+//     occurred must call [InvalidateEnv] for later nil-Env commands to
+//     observe the change.
+//   - Cmd.Process and Cmd.ProcessState are value fields, and a Cmd must
+//     not be copied after first use.
 //   - The child always starts with all signal dispositions reset to their
 //     defaults and an empty signal mask.
 //
-// A Cmd cannot be reused after calling [Cmd.Start], [Cmd.Run],
-// [Cmd.Output], or [Cmd.CombinedOutput], and its methods must not be
-// called concurrently, matching [os/exec].
+// A Cmd must be returned to its pre-start state with [Cmd.Reset] before it
+// can be started again, and its methods must not be called concurrently.
+// For running the same command many times, [Spec] freezes the marshaled
+// command at construction, spawns with zero allocations, and is safe for
+// concurrent use.
+//
+// The FASTEXEC_NO_CLEAR_SIGHAND environment variable (read once at
+// startup) forces the Linux signal-mask fallback, for testing and triage.
 package fastexec
 
 import (
