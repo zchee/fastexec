@@ -90,8 +90,7 @@ func TestRunnerRun(t *testing.T) {
 						t.Fatalf("Run() #%d failed: %v", i, err)
 					}
 				} else {
-					var ee *ExitError
-					if !errors.As(err, &ee) {
+					if _, ok := errors.AsType[*ExitError](err); !ok {
 						t.Fatalf("Run() #%d = %v (%T), want *ExitError", i, err, err)
 					}
 				}
