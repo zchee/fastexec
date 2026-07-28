@@ -53,14 +53,15 @@ type cloneArgs struct {
 // child's write to errno is race-free and visible when clone3Spawn
 // returns in the parent.
 type childState struct {
-	errno   uint64    // 0: setup/execve errno written by the child on failure
-	dir     *byte     // 8: chdir(2) target, or nil
-	path    *byte     // 16: execve(2) path
-	argv    **byte    // 24: NULL-terminated argv vector
-	envp    **byte    // 32: NULL-terminated envp vector
-	fds     [3]uint64 // 40: high CLOEXEC source fds dup3'd onto 0, 1, 2
-	sigmask uint64    // 64: original signal mask, restored just before execve
-	pipefd  uint64    // 72: if non-zero, fd the child also writes errno to on failure
+	errno       uint64    // 0: setup/execve errno written by the child on failure
+	dir         *byte     // 8: chdir(2) target, or nil
+	path        *byte     // 16: execve(2) path
+	argv        **byte    // 24: NULL-terminated argv vector
+	envp        **byte    // 32: NULL-terminated envp vector
+	fds         [3]uint64 // 40: stdio source fds (>= 3) dup3'd onto 0, 1, 2
+	sigmask     uint64    // 64: original signal mask, restored just before execve when restoreMask != 0
+	pipefd      uint64    // 72: if non-zero, fd the child also writes errno to on failure
+	restoreMask uint64    // 80: non-zero if the child must restore sigmask (mask-dance fallback only)
 }
 
 // clone3Spawn issues clone3(2) with the given arguments and, in the
@@ -130,6 +131,19 @@ const cloneFlags = unix.CLONE_VFORK | unix.CLONE_VM | unix.CLONE_PIDFD
 // (typically by a seccomp policy), so later spawns go straight to the
 // clone(2) fallback.
 var clone3Unavailable atomic.Bool
+
+// clearSighandUnavailable latches whether CLONE_CLEAR_SIGHAND was
+// observed to be rejected (EINVAL from a pre-5.5 kernel), so later
+// spawns go straight to the signal-mask fallback. The
+// FASTEXEC_NO_CLEAR_SIGHAND environment variable forces the latch, for
+// testing the fallback on kernels that support the flag.
+var clearSighandUnavailable atomic.Bool
+
+func init() {
+	if os.Getenv("FASTEXEC_NO_CLEAR_SIGHAND") != "" {
+		clearSighandUnavailable.Store(true)
+	}
+}
 
 // errnoViaPipe reports whether exec failures must be reported through a
 // pipe instead of the vfork-shared childState.
@@ -248,61 +262,17 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) (*Process, error) {
 	if usePipe {
 		st.child.pipefd = uint64(pipeW)
 	}
-	st.pidfd = -1
-	stackBase := uintptr(unsafe.Pointer(&st.stack[0]))
-	st.cargs = cloneArgs{
-		flags:      cloneFlags,
-		pidFD:      uint64(uintptr(unsafe.Pointer(&st.pidfd))),
-		exitSignal: uint64(unix.SIGCHLD),
-		stack:      uint64(stackBase),
-		stackSize:  uint64(len(st.stack)),
-	}
-	// clone(2) takes the initial stack pointer directly and encodes the
-	// exit signal in the flag word.
-	stackTop := stackBase + uintptr(len(st.stack))
-	rawFlags := uintptr(cloneFlags) | uintptr(unix.SIGCHLD)
-	tryClone3 := !clone3Unavailable.Load()
-
-	// Block every signal on this thread for the duration of the vfork
-	// window so no Go signal handler can run in the child, which shares
-	// this address space and TLS until execve. The child restores the
-	// original mask (saved into st.child.sigmask) immediately before
-	// execve. Between the two rawSigprocmask calls only nosplit
-	// assembly runs, so the window contains no preemption points.
-	runtime.LockOSThread()
-	if e := rawSigprocmask(sigSetMask, &allSigs, &st.child.sigmask); e != 0 {
-		runtime.UnlockOSThread()
-		return nil, &Error{Name: c.Path, Err: unix.Errno(e)}
-	}
-	var pid, e uintptr
-	fellBack := !tryClone3
-	if tryClone3 {
-		pid, e = clone3Spawn(&st.cargs, unsafe.Sizeof(st.cargs), &st.child)
-		if unix.Errno(e) == unix.ENOSYS || unix.Errno(e) == unix.EPERM {
-			fellBack = true
-			pid, e = cloneSpawn(rawFlags, stackTop, &st.pidfd, &st.child)
-		}
-	} else {
-		pid, e = cloneSpawn(rawFlags, stackTop, &st.pidfd, &st.child)
-	}
-	rawSigprocmask(sigSetMask, &st.child.sigmask, nil)
-	runtime.UnlockOSThread()
-	runtime.KeepAlive(st)
+	pid, errno := rawSpawn(st)
 	runtime.KeepAlive(files)
-
-	if e != 0 {
+	if errno != 0 {
 		if usePipe {
 			unix.Close(pipeR)
 			unix.Close(pipeW)
 		}
-		errno := unix.Errno(e)
 		if errno == unix.ENOSYS || errno == unix.EINVAL {
 			return nil, &Error{Name: c.Path, Err: errors.New("clone3/clone(CLONE_PIDFD) unavailable: fastexec requires Linux 5.4+ and a seccomp policy permitting them")}
 		}
 		return nil, &Error{Name: c.Path, Err: os.NewSyscallError("clone", errno)}
-	}
-	if fellBack && tryClone3 {
-		clone3Unavailable.Store(true)
 	}
 
 	if usePipe {
@@ -322,6 +292,110 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) (*Process, error) {
 		return nil, &Error{Name: c.Path, Err: unix.Errno(st.child.errno)}
 	}
 	return &Process{Pid: int(pid), pidfd: int(st.pidfd)}, nil
+}
+
+// rawSpawn issues the clone3(2)/clone(2) call described by st.child and
+// st.stack, handling the CLONE_CLEAR_SIGHAND and clone3 availability
+// latches. The caller must have populated st.child (rawSpawn owns the
+// sigmask and restoreMask fields) and keeps st reachable across the
+// call.
+//
+// On the fast path (clone3 accepting CLONE_CLEAR_SIGHAND, Linux 5.5+)
+// the kernel resets every signal disposition to SIG_DFL atomically
+// inside the child, so no Go signal handler can ever run in the shared
+// address space and no signal masking or thread pinning is needed at
+// all. Kernels that reject the flag (EINVAL, pre-5.5) latch
+// clearSighandUnavailable and retry with the fallback: block every
+// signal on this thread for the vfork window and have the child restore
+// the original mask immediately before execve. Between mask and restore
+// only nosplit assembly runs, so the window contains no preemption
+// points. The clone(2) seccomp fallback cannot express
+// CLONE_CLEAR_SIGHAND and always uses the mask dance.
+func rawSpawn(st *spawnState) (pid uintptr, err unix.Errno) {
+	st.pidfd = -1
+	stackBase := uintptr(unsafe.Pointer(&st.stack[0]))
+	st.cargs = cloneArgs{
+		flags:      cloneFlags,
+		pidFD:      uint64(uintptr(unsafe.Pointer(&st.pidfd))),
+		exitSignal: uint64(unix.SIGCHLD),
+		stack:      uint64(stackBase),
+		stackSize:  uint64(len(st.stack)),
+	}
+	// clone(2) takes the initial stack pointer directly and encodes the
+	// exit signal in the flag word.
+	stackTop := stackBase + uintptr(len(st.stack))
+	rawFlags := uintptr(cloneFlags) | uintptr(unix.SIGCHLD)
+
+	tryClone3 := !clone3Unavailable.Load()
+	useClear := tryClone3 && !clearSighandUnavailable.Load()
+	st.child.restoreMask = 0
+	masked := false
+	if useClear {
+		st.cargs.flags |= unix.CLONE_CLEAR_SIGHAND
+	} else {
+		if e := st.beginMask(); e != 0 {
+			return 0, e
+		}
+		masked = true
+	}
+
+	var e uintptr
+	fellBack := !tryClone3
+	if tryClone3 {
+		pid, e = clone3Spawn(&st.cargs, unsafe.Sizeof(st.cargs), &st.child)
+		if useClear && unix.Errno(e) == unix.EINVAL {
+			// The kernel predates CLONE_CLEAR_SIGHAND (5.4): latch it
+			// off and retry this and every later spawn with the
+			// signal-mask fallback.
+			clearSighandUnavailable.Store(true)
+			useClear = false
+			st.cargs.flags = cloneFlags
+			if me := st.beginMask(); me != 0 {
+				return 0, me
+			}
+			masked = true
+			pid, e = clone3Spawn(&st.cargs, unsafe.Sizeof(st.cargs), &st.child)
+		}
+		if unix.Errno(e) == unix.ENOSYS || unix.Errno(e) == unix.EPERM {
+			fellBack = true
+			if !masked {
+				// clone(2) cannot clear dispositions atomically.
+				if me := st.beginMask(); me != 0 {
+					return 0, me
+				}
+				masked = true
+			}
+			pid, e = cloneSpawn(rawFlags, stackTop, &st.pidfd, &st.child)
+		}
+	} else {
+		pid, e = cloneSpawn(rawFlags, stackTop, &st.pidfd, &st.child)
+	}
+	if masked {
+		rawSigprocmask(sigSetMask, &st.child.sigmask, nil)
+		runtime.UnlockOSThread()
+	}
+	runtime.KeepAlive(st)
+	if e != 0 {
+		return 0, unix.Errno(e)
+	}
+	if fellBack && tryClone3 {
+		clone3Unavailable.Store(true)
+	}
+	return pid, 0
+}
+
+// beginMask blocks every signal on the calling thread ahead of a spawn
+// that cannot use CLONE_CLEAR_SIGHAND, saving the previous mask into
+// st.child.sigmask for the child (and later the parent) to restore, and
+// marks the child to perform that restore just before execve.
+func (st *spawnState) beginMask() unix.Errno {
+	runtime.LockOSThread()
+	st.child.restoreMask = 1
+	if e := rawSigprocmask(sigSetMask, &allSigs, &st.child.sigmask); e != 0 {
+		runtime.UnlockOSThread()
+		return unix.Errno(e)
+	}
+	return 0
 }
 
 // readChildErrno reads the child's exec-failure report from the error

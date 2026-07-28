@@ -35,6 +35,7 @@
 #define CHILD_FD2	56
 #define CHILD_SIGMASK	64
 #define CHILD_PIPEFD	72
+#define CHILD_RESTORE	80
 
 // func clone3Spawn(cargs *cloneArgs, size uintptr, child *childState) (pid, errno uintptr)
 //
@@ -137,6 +138,12 @@ TEXT ·childRun(SB), NOSPLIT, $0
 	BCS  childfail
 
 nochdir:
+	// Restore the parent-saved signal mask only on the mask-dance
+	// fallback; the CLONE_CLEAR_SIGHAND fast path never masked, and the
+	// child's dispositions are already all SIG_DFL.
+	MOVD CHILD_RESTORE(R19), R0
+	CBZ  R0, doexec
+
 	// rt_sigprocmask(SIG_SETMASK, &child.sigmask, NULL, 8): restore the
 	// mask the parent saved before blocking all signals. Done last so no
 	// Go signal handler can run in the child on the shared address space.
@@ -147,6 +154,7 @@ nochdir:
 	MOVD $SYS_rt_sigprocmask, R8
 	SVC  $0
 
+doexec:
 	// execve(path, argv, envp)
 	MOVD CHILD_PATH(R19), R0
 	MOVD CHILD_ARGV(R19), R1
