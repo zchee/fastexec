@@ -42,6 +42,15 @@ const (
 //go:linkname syscall_syscall6 syscall.syscall6
 func syscall_syscall6(fn, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err unix.Errno)
 
+// syscall_rawSyscall6 is the raw variant of syscall_syscall6: no
+// entersyscall/exitsyscall bookkeeping, saving ~100ns each way. Only
+// used for libSystem calls that complete in bounded userspace time (the
+// posix_spawnattr and file-actions bookkeeping family); posix_spawn
+// itself blocks in the kernel and stays on syscall_syscall6.
+//
+//go:linkname syscall_rawSyscall6 syscall.rawSyscall6
+func syscall_rawSyscall6(fn, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err unix.Errno)
+
 // Lazily bound libSystem symbols; the trampolines live in
 // fastexec_darwin.s.
 //
@@ -76,21 +85,86 @@ func libcCall(fn, a1, a2, a3, a4, a5, a6 uintptr) unix.Errno {
 	return unix.Errno(r1)
 }
 
-// spawnState carries the reusable per-spawn resources: the C-string arena
-// and the opaque posix_spawn attribute and file-action objects (which are
-// initialized and destroyed per spawn, since file actions accumulate).
+// libcCallRaw is libcCall without scheduler interaction, for the
+// non-blocking posix_spawn bookkeeping calls.
+func libcCallRaw(fn, a1, a2, a3, a4, a5, a6 uintptr) unix.Errno {
+	r1, _, _ := syscall_rawSyscall6(fn, a1, a2, a3, a4, a5, a6)
+	return unix.Errno(r1)
+}
+
+// spawnState carries the reusable per-spawn resources: the C-string
+// arena, the pooled posix_spawn attribute (whose settings are identical
+// for every spawn, so it is initialized once per spawnState), and the
+// opaque file-actions object (initialized and destroyed per spawn,
+// since file actions accumulate).
 type spawnState struct {
 	cs      cstrs
-	attr    uintptr // posix_spawnattr_t (void *)
-	facts   uintptr // posix_spawn_file_actions_t (void *)
-	sigFull uint32  // sigset_t: all signals
-	sigNone uint32  // sigset_t: empty
+	attr    uintptr    // pooled posix_spawnattr_t (void *)
+	attrErr unix.Errno // non-zero if the one-time attr setup failed
+	facts   uintptr    // posix_spawn_file_actions_t (void *)
 	pid     int32
 }
 
-// spawnPool recycles spawnState values across spawns.
+// spawnPool recycles spawnState values, including their pooled spawn
+// attributes, across spawns.
 var spawnPool = sync.Pool{
-	New: func() any { return &spawnState{} },
+	New: func() any {
+		st := &spawnState{}
+		st.initAttr()
+		return st
+	},
+}
+
+// initAttr performs the one-time posix_spawnattr_t setup shared by every
+// spawn: all signal dispositions reset to their defaults, an empty
+// signal mask, and POSIX_SPAWN_CLOEXEC_DEFAULT. The C allocation is
+// destroyed by a runtime.AddCleanup when the spawnState is collected,
+// which by construction means it has left the pool, so pool churn can
+// neither leak nor double-free it.
+func (st *spawnState) initAttr() {
+	if e := libcCallRaw(
+		libc_posix_spawnattr_init_trampoline_addr,
+		uintptr(unsafe.Pointer(&st.attr)), 0, 0, 0, 0, 0); e != 0 {
+		st.attrErr = e
+		return
+	}
+	sigFull := ^uint32(0)
+	sigNone := uint32(0)
+	if e := libcCallRaw(
+		libc_posix_spawnattr_setsigdefault_trampoline_addr,
+		uintptr(unsafe.Pointer(&st.attr)), uintptr(unsafe.Pointer(&sigFull)), 0, 0, 0, 0); e != 0 {
+		st.destroyAttrOnErr(e)
+		return
+	}
+	if e := libcCallRaw(
+		libc_posix_spawnattr_setsigmask_trampoline_addr,
+		uintptr(unsafe.Pointer(&st.attr)), uintptr(unsafe.Pointer(&sigNone)), 0, 0, 0, 0); e != 0 {
+		st.destroyAttrOnErr(e)
+		return
+	}
+	if e := libcCallRaw(
+		libc_posix_spawnattr_setflags_trampoline_addr,
+		uintptr(unsafe.Pointer(&st.attr)),
+		posixSpawnSetSigDef|posixSpawnSetSigMask|posixSpawnCloexecDefault, 0, 0, 0, 0); e != 0 {
+		st.destroyAttrOnErr(e)
+		return
+	}
+	runtime.AddCleanup(st, func(attr uintptr) {
+		libcCallRaw(
+			libc_posix_spawnattr_destroy_trampoline_addr,
+			uintptr(unsafe.Pointer(&attr)), 0, 0, 0, 0, 0)
+	}, st.attr)
+}
+
+// destroyAttrOnErr releases a partially configured attribute and
+// records why the setup failed; every spawn using this spawnState then
+// reports that error.
+func (st *spawnState) destroyAttrOnErr(e unix.Errno) {
+	libcCallRaw(
+		libc_posix_spawnattr_destroy_trampoline_addr,
+		uintptr(unsafe.Pointer(&st.attr)), 0, 0, 0, 0, 0)
+	st.attr = 0
+	st.attrErr = e
 }
 
 // startProcess spawns c.Path via posix_spawn(2) and returns the resulting
@@ -148,57 +222,31 @@ func startProcess(c *Cmd, files [3]*os.File) (*Process, error) {
 		}
 	}()
 
-	st.attr = 0
-	if e := libcCall(
-		libc_posix_spawnattr_init_trampoline_addr,
-		uintptr(unsafe.Pointer(&st.attr)), 0, 0, 0, 0, 0); e != 0 {
-		return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawnattr_init", e)}
-	}
-	defer libcCall(
-		libc_posix_spawnattr_destroy_trampoline_addr,
-		uintptr(unsafe.Pointer(&st.attr)), 0, 0, 0, 0, 0)
-
-	// Reset every signal disposition to its default and start the child
-	// with an empty signal mask, so the Go runtime's handlers and mask
-	// never leak into the child.
-	st.sigFull = ^uint32(0)
-	st.sigNone = 0
-	if e := libcCall(
-		libc_posix_spawnattr_setsigdefault_trampoline_addr,
-		uintptr(unsafe.Pointer(&st.attr)), uintptr(unsafe.Pointer(&st.sigFull)), 0, 0, 0, 0); e != 0 {
-		return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawnattr_setsigdefault", e)}
-	}
-	if e := libcCall(
-		libc_posix_spawnattr_setsigmask_trampoline_addr,
-		uintptr(unsafe.Pointer(&st.attr)), uintptr(unsafe.Pointer(&st.sigNone)), 0, 0, 0, 0); e != 0 {
-		return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawnattr_setsigmask", e)}
-	}
-	if e := libcCall(
-		libc_posix_spawnattr_setflags_trampoline_addr,
-		uintptr(unsafe.Pointer(&st.attr)),
-		posixSpawnSetSigDef|posixSpawnSetSigMask|posixSpawnCloexecDefault, 0, 0, 0, 0); e != 0 {
-		return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawnattr_setflags", e)}
+	// The pooled attribute already carries SETSIGDEF, SETSIGMASK, and
+	// CLOEXEC_DEFAULT; only the per-spawn file actions are built here.
+	if st.attrErr != 0 {
+		return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawnattr_init", st.attrErr)}
 	}
 
 	st.facts = 0
-	if e := libcCall(
+	if e := libcCallRaw(
 		libc_posix_spawn_file_actions_init_trampoline_addr,
 		uintptr(unsafe.Pointer(&st.facts)), 0, 0, 0, 0, 0); e != 0 {
 		return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_init", e)}
 	}
-	defer libcCall(
+	defer libcCallRaw(
 		libc_posix_spawn_file_actions_destroy_trampoline_addr,
 		uintptr(unsafe.Pointer(&st.facts)), 0, 0, 0, 0, 0)
 
 	for i, h := range highs {
-		if e := libcCall(
+		if e := libcCallRaw(
 			libc_posix_spawn_file_actions_adddup2_trampoline_addr,
 			uintptr(unsafe.Pointer(&st.facts)), uintptr(h), uintptr(i), 0, 0, 0); e != 0 {
 			return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_adddup2", e)}
 		}
 	}
 	if dirp != nil {
-		if e := libcCall(
+		if e := libcCallRaw(
 			libc_posix_spawn_file_actions_addchdir_np_trampoline_addr,
 			uintptr(unsafe.Pointer(&st.facts)), uintptr(unsafe.Pointer(dirp)), 0, 0, 0, 0); e != 0 {
 			return nil, &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_addchdir_np", e)}
