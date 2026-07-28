@@ -51,7 +51,7 @@ type Runner struct {
 // name is used, as with [Command]. A nil env freezes a snapshot of the
 // current environment (via the same cache as a nil Cmd.Env); an empty
 // dir inherits the parent's working directory.
-func NewRunner(name string, args []string, env []string, dir string) (*Runner, error) {
+func NewRunner(name string, args, env []string, dir string) (*Runner, error) {
 	path := name
 	if filepath.Base(name) == name {
 		lp, err := exec.LookPath(name)

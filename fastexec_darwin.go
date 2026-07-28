@@ -123,7 +123,8 @@ var spawnPool = sync.Pool{
 func (st *spawnState) initAttr() {
 	if e := libcCallRaw(
 		libc_posix_spawnattr_init_trampoline_addr,
-		uintptr(unsafe.Pointer(&st.attr)), 0, 0, 0, 0, 0); e != 0 {
+		uintptr(unsafe.Pointer(&st.attr)), 0, 0, 0, 0, 0,
+	); e != 0 {
 		st.attrErr = e
 		return
 	}
@@ -131,27 +132,31 @@ func (st *spawnState) initAttr() {
 	sigNone := uint32(0)
 	if e := libcCallRaw(
 		libc_posix_spawnattr_setsigdefault_trampoline_addr,
-		uintptr(unsafe.Pointer(&st.attr)), uintptr(unsafe.Pointer(&sigFull)), 0, 0, 0, 0); e != 0 {
+		uintptr(unsafe.Pointer(&st.attr)), uintptr(unsafe.Pointer(&sigFull)), 0, 0, 0, 0,
+	); e != 0 {
 		st.destroyAttrOnErr(e)
 		return
 	}
 	if e := libcCallRaw(
 		libc_posix_spawnattr_setsigmask_trampoline_addr,
-		uintptr(unsafe.Pointer(&st.attr)), uintptr(unsafe.Pointer(&sigNone)), 0, 0, 0, 0); e != 0 {
+		uintptr(unsafe.Pointer(&st.attr)), uintptr(unsafe.Pointer(&sigNone)), 0, 0, 0, 0,
+	); e != 0 {
 		st.destroyAttrOnErr(e)
 		return
 	}
 	if e := libcCallRaw(
 		libc_posix_spawnattr_setflags_trampoline_addr,
 		uintptr(unsafe.Pointer(&st.attr)),
-		posixSpawnSetSigDef|posixSpawnSetSigMask|posixSpawnCloexecDefault, 0, 0, 0, 0); e != 0 {
+		posixSpawnSetSigDef|posixSpawnSetSigMask|posixSpawnCloexecDefault, 0, 0, 0, 0,
+	); e != 0 {
 		st.destroyAttrOnErr(e)
 		return
 	}
 	runtime.AddCleanup(st, func(attr uintptr) {
 		libcCallRaw(
 			libc_posix_spawnattr_destroy_trampoline_addr,
-			uintptr(unsafe.Pointer(&attr)), 0, 0, 0, 0, 0)
+			uintptr(unsafe.Pointer(&attr)), 0, 0, 0, 0, 0,
+		)
 	}, st.attr)
 }
 
@@ -161,7 +166,8 @@ func (st *spawnState) initAttr() {
 func (st *spawnState) destroyAttrOnErr(e unix.Errno) {
 	libcCallRaw(
 		libc_posix_spawnattr_destroy_trampoline_addr,
-		uintptr(unsafe.Pointer(&st.attr)), 0, 0, 0, 0, 0)
+		uintptr(unsafe.Pointer(&st.attr)), 0, 0, 0, 0, 0,
+	)
 	st.attr = 0
 	st.attrErr = e
 }
@@ -210,7 +216,8 @@ func spawnRunner(s *Runner, files [3]*os.File) (int, error) {
 	}
 	if files[0] == null && files[1] == null && files[2] == null {
 		st.pid = 0
-		e := libcCall(libc_posix_spawn_trampoline_addr,
+		e := libcCall(
+			libc_posix_spawn_trampoline_addr,
 			uintptr(unsafe.Pointer(&st.pid)), uintptr(unsafe.Pointer(s.pathp)),
 			uintptr(unsafe.Pointer(&s.os.nullFacts)), uintptr(unsafe.Pointer(&st.attr)),
 			uintptr(unsafe.Pointer(s.argvp)), uintptr(unsafe.Pointer(s.envp)),
@@ -292,7 +299,8 @@ func spawn1(st *spawnState, name string, pathp, dirp *byte, argvp, envp **byte, 
 	}
 
 	st.pid = 0
-	e := libcCall(libc_posix_spawn_trampoline_addr,
+	e := libcCall(
+		libc_posix_spawn_trampoline_addr,
 		uintptr(unsafe.Pointer(&st.pid)), uintptr(unsafe.Pointer(pathp)),
 		uintptr(unsafe.Pointer(&st.facts)), uintptr(unsafe.Pointer(&st.attr)),
 		uintptr(unsafe.Pointer(argvp)), uintptr(unsafe.Pointer(envp)),
