@@ -77,7 +77,7 @@ process-creation primitives while keeping an `os/exec`-shaped API.
   (file-actions init/dup2/chdir/destroy) goes through `syscall.rawSyscall6`
   — no scheduler round trip; only the blocking `posix_spawn` itself pays
   `entersyscall`. The `Cmd` path makes 6 libc calls per spawn.
-- A `Spec` (see below) with all-nil stdio freezes its file actions at
+- A `Runner` (see below) with all-nil stdio freezes its file actions at
   construction: such a spawn is **one** `posix_spawn` libc call plus the
   `wait4` — the platform floor without reimplementing Apple's private
   `__posix_spawn` ABI.
@@ -93,9 +93,9 @@ process-creation primitives while keeping an `os/exec`-shaped API.
 - `Cmd.Process` and `Cmd.ProcessState` are value fields, `(*Cmd).Reset`
   returns a Cmd to its pre-start state, and the nil-`Env` environment
   snapshot is cached process-wide (`InvalidateEnv` refreshes it): a reused
-  `Cmd` with preset `Env` and every `Spec.Run` spawn **zero heap
+  `Cmd` with preset `Env` and every `Runner.Run` spawn **zero heap
   allocations** (`testing.AllocsPerRun == 0`, enforced in tests).
-- `Spec` freezes PATH resolution, argv, env, and dir at construction into
+- `Runner` freezes PATH resolution, argv, env, and dir at construction into
   a retained arena; it is immutable and safe for concurrent use — built
   for hot loops and worker pools running one command many times.
 - Stdio is `*os.File` only (nil means a shared `/dev/null`), so the hot
@@ -123,11 +123,11 @@ for range jobs {
 	c.Reset()
 }
 
-// Spec: freeze the command once, spawn concurrently with 0 allocs/op.
-spec, err := fastexec.NewSpec("/usr/bin/worker", []string{"--fast"}, nil, "")
+// Runner: freeze the command once, spawn concurrently with 0 allocs/op.
+r, err := fastexec.NewRunner("/usr/bin/worker", []string{"--fast"}, nil, "")
 if err != nil { ... }
 var ps fastexec.ProcessState
-if err := spec.Run(nil, nil, nil, &ps); err != nil { ... }
+if err := r.Run(nil, nil, nil, &ps); err != nil { ... }
 
 // After os.Setenv, refresh the cached nil-Env snapshot.
 os.Setenv("MODE", "prod")
@@ -144,35 +144,35 @@ Apple M3 Max (Darwin arm64, 16 cores):
 ```
 BenchmarkRunFastexec-16          1.402m ± 2%    419 B/op    2 allocs/op
 BenchmarkRunFastexecReset-16     1.414m ± 2%      0 B/op    0 allocs/op
-BenchmarkRunSpec-16              1.397m ± 3%      0 B/op    0 allocs/op
+BenchmarkRunnerRun-16            1.397m ± 3%      0 B/op    0 allocs/op
 BenchmarkRunOsExec-16            2.469m ± 1%   1336 B/op   25 allocs/op
-BenchmarkRunParallelSpec-16       149.0µ ±14%      0 B/op    0 allocs/op
-BenchmarkRunParallelFastexec-16   157.3µ ±26%    419 B/op    2 allocs/op
-BenchmarkRunParallelOsExec-16     485.0µ ± 1%   1399 B/op   25 allocs/op
+BenchmarkRunnerRunParallel-16    149.0µ ±14%      0 B/op    0 allocs/op
+BenchmarkRunParallelFastexec-16  157.3µ ±26%    419 B/op    2 allocs/op
+BenchmarkRunParallelOsExec-16    485.0µ ± 1%   1399 B/op   25 allocs/op
 ```
 
 Linux arm64 (lima VM, Ubuntu 6.17 kernel, 8 vCPU):
 
 ```
-BenchmarkRunFastexec-8            220.2µ ± 2%    412 B/op    2 allocs/op
-BenchmarkRunFastexecReset-8       219.2µ ± 2%      0 B/op    0 allocs/op
-BenchmarkRunSpec-8                220.2µ ± 3%      0 B/op    0 allocs/op
-BenchmarkRunOsExec-8              243.4µ ± 1%   1576 B/op   30 allocs/op
-BenchmarkRunParallelSpec-8        34.19µ ± 1%      0 B/op    0 allocs/op
-BenchmarkRunParallelFastexec-8    34.73µ ± 7%    415 B/op    2 allocs/op
-BenchmarkRunParallelOsExec-8      44.84µ ± 5%   1576 B/op   30 allocs/op
+BenchmarkRunFastexec-8           220.2µ ± 2%    412 B/op    2 allocs/op
+BenchmarkRunFastexecReset-8      219.2µ ± 2%      0 B/op    0 allocs/op
+BenchmarkRunnerRun-8             220.2µ ± 3%      0 B/op    0 allocs/op
+BenchmarkRunOsExec-8             243.4µ ± 1%   1576 B/op   30 allocs/op
+BenchmarkRunnerRunParallel-8     34.19µ ± 1%      0 B/op    0 allocs/op
+BenchmarkRunParallelFastexec-8   34.73µ ± 7%    415 B/op    2 allocs/op
+BenchmarkRunParallelOsExec-8     44.84µ ± 5%   1576 B/op   30 allocs/op
 ```
 
 1.8x (sequential) to 3.3x (parallel) faster on Darwin, 1.1–1.3x on Linux,
 with zero steady-state allocations against 25–30 for `os/exec`.
 
-### Parallel scaling (`-cpu` sweep, `Spec.Run` vs `os/exec`)
+### Parallel scaling (`-cpu` sweep, `Runner.Run` vs `os/exec`)
 
 The gap widens with core count because `os/exec` serializes on
 `ForkLock` while fastexec never takes it — on Darwin `os/exec` stops
 scaling entirely past 8 cores:
 
-| GOMAXPROCS | darwin Spec | darwin os/exec | ratio | linux Spec | linux os/exec | ratio |
+| GOMAXPROCS | darwin Runner | darwin os/exec | ratio | linux Runner | linux os/exec | ratio |
 |---:|---:|---:|---:|---:|---:|---:|
 | 1  | 1447µs | 2441µs | 1.7x | 225µs | 246µs | 1.1x |
 | 4  | 326µs  | 648µs  | 2.0x | 61.6µs | 68.2µs | 1.1x |
@@ -183,13 +183,13 @@ scaling entirely past 8 cores:
 
 Darwin `os/exec` forks, so spawn cost grows with the parent's memory
 image; `posix_spawn` does not: with a 4 GiB ballast `os/exec` degrades
-2.44ms → 2.75ms (+12%) while `Spec.Run` stays within noise of its
+2.44ms → 2.75ms (+12%) while `Runner.Run` stays within noise of its
 no-ballast time (~1.46ms median). On Linux both are vfork-class and
 neither degrades. (Run with `FASTEXEC_BENCH_BALLAST_GIB=4`.)
 
 ### Syscall profile
 
-`strace -f -c` over 1000 warmed `Spec.Run` spawns (lima, Ubuntu
+`strace -f -c` over 1000 warmed `Runner.Run` spawns (lima, Ubuntu
 6.17.0-29 arm64) — the parent-side cost per spawn is exactly 3 syscalls
 (`clone3` + `waitid` + `close`); `fcntl`, `pipe2`, and `rt_sigprocmask`
 appear only as O(1) startup/probe totals:
@@ -229,7 +229,7 @@ and was dropped per the optimization plan's measurement gate.
 - Unsupported `os/exec` features: `ExtraFiles`, `SysProcAttr`, `Cancel`,
   `WaitDelay`, and `StdinPipe`-style helpers.
 
-`Cmd` methods must not be called concurrently; `Spec` is safe for
+`Cmd` methods must not be called concurrently; `Runner` is safe for
 concurrent use.
 
 ### Environment knobs (testing/triage)
@@ -241,7 +241,7 @@ concurrent use.
 
 - Go 1.26+
 - Linux 5.4+ on amd64 or arm64 (5.5+ engages the no-masking fast path),
-  or any supported Darwin (macOS 10.15+ if `Cmd.Dir`/`NewSpec` dir is
+  or any supported Darwin (macOS 10.15+ if `Cmd.Dir`/`NewRunner` dir is
   used, for `posix_spawn_file_actions_addchdir_np`)
 
 ## Acknowledgments

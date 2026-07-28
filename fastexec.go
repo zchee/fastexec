@@ -49,7 +49,7 @@
 //     SETSIGMASK, CLOEXEC_DEFAULT) are initialized once per pooled spawn
 //     state rather than per spawn, and CLOEXEC_DEFAULT guarantees that no
 //     file descriptor other than the requested stdio descriptors leaks
-//     into the child, again without [syscall.ForkLock]. A [Spec] with
+//     into the child, again without [syscall.ForkLock]. A [Runner] with
 //     all-nil stdio also freezes its file actions, reducing a spawn to a
 //     single posix_spawn libc call plus the wait4.
 //
@@ -57,7 +57,7 @@
 // pooled, reusable arena as NUL-terminated C strings referenced by raw
 // pointers, so steady-state spawning performs no per-string heap
 // allocations. A [Cmd] respawned through [Cmd.Reset] with a preset Env,
-// and [Spec.Run] always, perform zero heap allocations per spawn.
+// and [Runner.Run] always, perform zero heap allocations per spawn.
 //
 // # Differences from os/exec
 //
@@ -81,7 +81,7 @@
 //
 // A Cmd must be returned to its pre-start state with [Cmd.Reset] before it
 // can be started again, and its methods must not be called concurrently.
-// For running the same command many times, [Spec] freezes the marshaled
+// For running the same command many times, [Runner] freezes the marshaled
 // command at construction, spawns with zero allocations, and is safe for
 // concurrent use.
 //
@@ -509,7 +509,7 @@ func (c *Cmd) Reset() {
 // Wait blocks until the process exits, stores its final state into ps,
 // and releases the process handle. It returns an [*ExitError] if the
 // process exited unsuccessfully. Wait must be called exactly once per
-// started process; it is used with [Spec.Start], while [Cmd.Wait]
+// started process; it is used with [Runner.Start], while [Cmd.Wait]
 // wraps it with the Cmd bookkeeping.
 func (p *Process) Wait(ps *ProcessState) error {
 	err := p.wait(ps)

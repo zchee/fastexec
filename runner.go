@@ -22,28 +22,28 @@ import (
 	"path/filepath"
 )
 
-// Spec is a frozen command: the path (resolved through PATH once, like
+// Runner is a frozen command: the path (resolved through PATH once, like
 // [Command]), argv, environment, and working directory are marshaled
 // into a retained arena at construction, so spawning performs no PATH
 // lookup, no marshaling, and no heap allocation at all. On Darwin a
-// Spec spawned with all-nil stdio additionally uses a file-actions
+// Runner spawned with all-nil stdio additionally uses a file-actions
 // object frozen at construction, reducing the spawn to a single
 // posix_spawn libc call.
 //
-// Unlike a [Cmd], a Spec is immutable after construction and safe for
+// Unlike a [Cmd], a Runner is immutable after construction and safe for
 // concurrent use by multiple goroutines. It is intended for hot loops
 // and worker pools that run the same command many times.
-type Spec struct {
+type Runner struct {
 	path  string
 	cs    cstrs
 	pathp *byte
 	dirp  *byte
 	argvp **byte
 	envp  **byte
-	os    specOS
+	os    runnerOS
 }
 
-// NewSpec freezes the named program with the given arguments,
+// NewRunner freezes the named program with the given arguments,
 // environment, and working directory.
 //
 // Name resolution follows [Command]: a name without path separators is
@@ -51,7 +51,7 @@ type Spec struct {
 // name is used, as with [Command]. A nil env freezes a snapshot of the
 // current environment (via the same cache as a nil Cmd.Env); an empty
 // dir inherits the parent's working directory.
-func NewSpec(name string, args []string, env []string, dir string) (*Spec, error) {
+func NewRunner(name string, args []string, env []string, dir string) (*Runner, error) {
 	path := name
 	if filepath.Base(name) == name {
 		lp, err := exec.LookPath(name)
@@ -67,7 +67,7 @@ func NewSpec(name string, args []string, env []string, dir string) (*Spec, error
 	argv = append(argv, name)
 	argv = append(argv, args...)
 
-	s := &Spec{path: path}
+	s := &Runner{path: path}
 	var err error
 	s.pathp, s.dirp, s.argvp, s.envp, err = s.cs.build(path, dir, argv, env)
 	if err != nil {
@@ -80,7 +80,7 @@ func NewSpec(name string, args []string, env []string, dir string) (*Spec, error
 }
 
 // stdio resolves nil streams to the shared /dev/null descriptor.
-func (s *Spec) stdio(stdin, stdout, stderr *os.File) ([3]*os.File, error) {
+func (s *Runner) stdio(stdin, stdout, stderr *os.File) ([3]*os.File, error) {
 	files := [3]*os.File{stdin, stdout, stderr}
 	for i, f := range files {
 		if f == nil {
@@ -98,14 +98,14 @@ func (s *Spec) stdio(stdin, stdout, stderr *os.File) ([3]*os.File, error) {
 // means /dev/null), filling in p, which must be in its zero or reset
 // state. After a successful Start the caller must call [Process.Wait]
 // to reap the child and release its resources. Callers that never
-// signal the child should prefer [Spec.Run], which bypasses the
+// signal the child should prefer [Runner.Run], which bypasses the
 // Process handle entirely.
-func (s *Spec) Start(stdin, stdout, stderr *os.File, p *Process) error {
+func (s *Runner) Start(stdin, stdout, stderr *os.File, p *Process) error {
 	files, err := s.stdio(stdin, stdout, stderr)
 	if err != nil {
 		return err
 	}
-	return startSpec(s, files, p)
+	return startRunner(s, files, p)
 }
 
 // Run spawns the frozen command, waits for it to complete, and stores
@@ -115,12 +115,12 @@ func (s *Spec) Start(stdin, stdout, stderr *os.File, p *Process) error {
 // Run reaps the child directly rather than through a [Process] handle
 // (whose signal-safety mutex would force a heap allocation), so it
 // performs zero heap allocations on the success path.
-func (s *Spec) Run(stdin, stdout, stderr *os.File, ps *ProcessState) error {
+func (s *Runner) Run(stdin, stdout, stderr *os.File, ps *ProcessState) error {
 	files, err := s.stdio(stdin, stdout, stderr)
 	if err != nil {
 		return err
 	}
-	if err := runSpec(s, files, ps); err != nil {
+	if err := runRunner(s, files, ps); err != nil {
 		return err
 	}
 	if !ps.Success() {

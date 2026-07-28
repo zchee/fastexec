@@ -65,9 +65,9 @@ func BenchmarkRunFastexecReset(b *testing.B) {
 	}
 }
 
-func BenchmarkRunSpec(b *testing.B) {
+func BenchmarkRunnerRun(b *testing.B) {
 	path := benchTarget(b)
-	s, err := NewSpec(path, nil, benchEnv, "")
+	s, err := NewRunner(path, nil, benchEnv, "")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -80,9 +80,9 @@ func BenchmarkRunSpec(b *testing.B) {
 	}
 }
 
-func BenchmarkRunParallelSpec(b *testing.B) {
+func BenchmarkRunnerRunParallel(b *testing.B) {
 	path := benchTarget(b)
-	s, err := NewSpec(path, nil, benchEnv, "")
+	s, err := NewRunner(path, nil, benchEnv, "")
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -144,10 +144,10 @@ func ballast(b *testing.B) []byte {
 	return bs
 }
 
-func BenchmarkRunSpecLargeHeap(b *testing.B) {
+func BenchmarkRunnerRunLargeHeap(b *testing.B) {
 	bs := ballast(b)
 	path := benchTarget(b)
-	s, err := NewSpec(path, nil, benchEnv, "")
+	s, err := NewRunner(path, nil, benchEnv, "")
 	if err != nil {
 		b.Fatal(err)
 	}

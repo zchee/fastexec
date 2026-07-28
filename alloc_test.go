@@ -36,13 +36,13 @@ func testTrue(t *testing.T) string {
 	return ""
 }
 
-// TestAllocsSpecRun asserts the acceptance criterion that a warmed
-// Spec.Run performs zero heap allocations per spawn.
-func TestAllocsSpecRun(t *testing.T) {
+// TestAllocsRunnerRun asserts the acceptance criterion that a warmed
+// Runner.Run performs zero heap allocations per spawn.
+func TestAllocsRunnerRun(t *testing.T) {
 	if raceEnabled {
 		t.Skip("race instrumentation perturbs allocation counts")
 	}
-	s, err := NewSpec(testTrue(t), nil, []string{}, "")
+	s, err := NewRunner(testTrue(t), nil, []string{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +57,7 @@ func TestAllocsSpecRun(t *testing.T) {
 		}
 	})
 	if n != 0 {
-		t.Fatalf("Spec.Run allocates %v/op, want 0", n)
+		t.Fatalf("Runner.Run allocates %v/op, want 0", n)
 	}
 }
 
@@ -152,7 +152,7 @@ func TestStdioFdMatrix(t *testing.T) {
 }
 
 // TestNoFDLeakAcrossSpawns runs a spawn-heavy mix (plain runs, pipe
-// captures, exec failures, Spec runs) and asserts the parent's
+// captures, exec failures, Runner runs) and asserts the parent's
 // descriptor table returns to its starting size. Deliberately not
 // parallel: it runs in the sequential phase, when no other test can
 // hold descriptors open.
@@ -179,7 +179,7 @@ func TestNoFDLeakAcrossSpawns(t *testing.T) {
 	}
 	before := countFDs()
 
-	s, err := NewSpec("sh", []string{"-c", "exit 0"}, []string{}, "")
+	s, err := NewRunner("sh", []string{"-c", "exit 0"}, []string{}, "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -202,10 +202,10 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) error {
 	return nil
 }
 
-// spawnSpec spawns the frozen s. The pooled spawnState contributes
-// only its child stack and clone bookkeeping; the Spec's retained
+// spawnRunner spawns the frozen s. The pooled spawnState contributes
+// only its child stack and clone bookkeeping; the Runner's retained
 // arena supplies every pointer handed to the kernel.
-func spawnSpec(s *Spec, files [3]*os.File) (pid, pidfd int, err error) {
+func spawnRunner(s *Runner, files [3]*os.File) (pid, pidfd int, err error) {
 	st := spawnPool.Get().(*spawnState)
 	defer spawnPool.Put(st)
 	pid, pidfd, err = spawn1(st, s.path, s.pathp, s.dirp, s.argvp, s.envp, files, errnoViaPipe())
@@ -213,9 +213,9 @@ func spawnSpec(s *Spec, files [3]*os.File) (pid, pidfd int, err error) {
 	return pid, pidfd, err
 }
 
-// startSpec spawns the frozen s, filling in p.
-func startSpec(s *Spec, files [3]*os.File, p *Process) error {
-	pid, pidfd, err := spawnSpec(s, files)
+// startRunner spawns the frozen s, filling in p.
+func startRunner(s *Runner, files [3]*os.File, p *Process) error {
+	pid, pidfd, err := spawnRunner(s, files)
 	if err != nil {
 		return err
 	}
@@ -224,10 +224,10 @@ func startSpec(s *Spec, files [3]*os.File, p *Process) error {
 	return nil
 }
 
-// runSpec spawns the frozen s and reaps it inline on the pidfd,
+// runRunner spawns the frozen s and reaps it inline on the pidfd,
 // avoiding the Process handle so the whole cycle is allocation-free.
-func runSpec(s *Spec, files [3]*os.File, ps *ProcessState) error {
-	_, pidfd, err := spawnSpec(s, files)
+func runRunner(s *Runner, files [3]*os.File, ps *ProcessState) error {
+	_, pidfd, err := spawnRunner(s, files)
 	if err != nil {
 		return err
 	}
@@ -238,7 +238,7 @@ func runSpec(s *Spec, files [3]*os.File, ps *ProcessState) error {
 
 // spawn1 wires stdio, sets up the optional error pipe, issues the
 // clone through rawSpawn, and maps failures; it is the spawn core
-// shared by the Cmd and Spec paths.
+// shared by the Cmd and Runner paths.
 func spawn1(st *spawnState, name string, pathp, dirp *byte, argvp, envp **byte, files [3]*os.File, usePipe bool) (pid, pidfd int, err error) {
 	highs, dupped, perr := prepStdio(files)
 	if perr != nil {
@@ -310,12 +310,12 @@ func spawn1(st *spawnState, name string, pathp, dirp *byte, argvp, envp **byte, 
 	return int(rawPid), int(st.pidfd), nil
 }
 
-// specOS is empty on Linux: a Spec needs no OS-specific frozen state
+// runnerOS is empty on Linux: a Runner needs no OS-specific frozen state
 // beyond the shared arena.
-type specOS struct{}
+type runnerOS struct{}
 
 // freeze is a no-op on Linux.
-func (s *Spec) freeze() error { return nil }
+func (s *Runner) freeze() error { return nil }
 
 // rawSpawn issues the clone3(2)/clone(2) call described by st.child and
 // st.stack, handling the CLONE_CLEAR_SIGHAND and clone3 availability

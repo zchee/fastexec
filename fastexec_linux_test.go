@@ -88,9 +88,9 @@ func TestSpawnUnderCPUProfile(t *testing.T) {
 			clearSighandUnavailable.Store(tt.latch)
 			t.Cleanup(func() { clearSighandUnavailable.Store(old) })
 
-			s, err := NewSpec("/bin/true", nil, []string{}, "")
+			s, err := NewRunner("/bin/true", nil, []string{}, "")
 			if err != nil {
-				s, err = NewSpec("/usr/bin/true", nil, []string{}, "")
+				s, err = NewRunner("/usr/bin/true", nil, []string{}, "")
 			}
 			if err != nil {
 				t.Skipf("no `true` binary: %v", err)

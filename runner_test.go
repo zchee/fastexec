@@ -30,9 +30,9 @@ import (
 	gocmp "github.com/google/go-cmp/cmp"
 )
 
-// specOutput runs s with its stdout connected to a pipe and returns
+// runnerOutput runs s with its stdout connected to a pipe and returns
 // everything the child wrote, exercising the non-frozen stdio path.
-func specOutput(t *testing.T, s *Spec) string {
+func runnerOutput(t *testing.T, s *Runner) string {
 	t.Helper()
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -53,7 +53,7 @@ func specOutput(t *testing.T, s *Spec) string {
 	return buf.String()
 }
 
-func TestSpecRun(t *testing.T) {
+func TestRunnerRun(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
@@ -76,11 +76,11 @@ func TestSpecRun(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
-			s, err := NewSpec("sh", tt.args, []string{}, "")
+			s, err := NewRunner("sh", tt.args, []string{}, "")
 			if err != nil {
-				t.Fatalf("NewSpec() failed: %v", err)
+				t.Fatalf("NewRunner() failed: %v", err)
 			}
-			// Run the frozen command repeatedly: the Spec must be
+			// Run the frozen command repeatedly: the Runner must be
 			// reusable with no state bleed between runs.
 			for i := range 3 {
 				var ps ProcessState
@@ -106,19 +106,19 @@ func TestSpecRun(t *testing.T) {
 	}
 }
 
-func TestSpecOutputAndEnv(t *testing.T) {
+func TestRunnerOutputAndEnv(t *testing.T) {
 	t.Parallel()
 
-	s, err := NewSpec("sh", []string{"-c", `printf '%s' "$FASTEXEC_SPEC_TEST"`}, []string{"FASTEXEC_SPEC_TEST=frozen-env"}, "")
+	s, err := NewRunner("sh", []string{"-c", `printf '%s' "$FASTEXEC_SPEC_TEST"`}, []string{"FASTEXEC_SPEC_TEST=frozen-env"}, "")
 	if err != nil {
-		t.Fatalf("NewSpec() failed: %v", err)
+		t.Fatalf("NewRunner() failed: %v", err)
 	}
-	if diff := gocmp.Diff("frozen-env", specOutput(t, s)); diff != "" {
+	if diff := gocmp.Diff("frozen-env", runnerOutput(t, s)); diff != "" {
 		t.Fatalf("frozen environment mismatch (-want +got):\n%s", diff)
 	}
 }
 
-func TestSpecDir(t *testing.T) {
+func TestRunnerDir(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
@@ -127,11 +127,11 @@ func TestSpecDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s, err := NewSpec("pwd", nil, []string{}, dir)
+	s, err := NewRunner("pwd", nil, []string{}, dir)
 	if err != nil {
-		t.Fatalf("NewSpec() failed: %v", err)
+		t.Fatalf("NewRunner() failed: %v", err)
 	}
-	got, err := filepath.EvalSymlinks(strings.TrimSuffix(specOutput(t, s), "\n"))
+	got, err := filepath.EvalSymlinks(strings.TrimSuffix(runnerOutput(t, s), "\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,12 +140,12 @@ func TestSpecDir(t *testing.T) {
 	}
 }
 
-func TestSpecConcurrent(t *testing.T) {
+func TestRunnerConcurrent(t *testing.T) {
 	t.Parallel()
 
-	s, err := NewSpec("sh", []string{"-c", "exit 0"}, []string{}, "")
+	s, err := NewRunner("sh", []string{"-c", "exit 0"}, []string{}, "")
 	if err != nil {
-		t.Fatalf("NewSpec() failed: %v", err)
+		t.Fatalf("NewRunner() failed: %v", err)
 	}
 	const workers = 32
 	var wg sync.WaitGroup
@@ -164,34 +164,34 @@ func TestSpecConcurrent(t *testing.T) {
 	wg.Wait()
 	close(errc)
 	for err := range errc {
-		t.Errorf("concurrent Spec.Run() failed: %v", err)
+		t.Errorf("concurrent Runner.Run() failed: %v", err)
 	}
 }
 
-func TestSpecErrors(t *testing.T) {
+func TestRunnerErrors(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]struct {
-		mk        func() (*Spec, error)
+		mk        func() (*Runner, error)
 		wantNew   bool
 		wantErrno syscall.Errno
 	}{
-		"error: PATH lookup failure at NewSpec": {
-			mk: func() (*Spec, error) {
-				return NewSpec("fastexec-test-definitely-not-a-command", nil, []string{}, "")
+		"error: PATH lookup failure at NewRunner": {
+			mk: func() (*Runner, error) {
+				return NewRunner("fastexec-test-definitely-not-a-command", nil, []string{}, "")
 			},
 			wantNew: true,
 		},
-		"error: NUL byte rejected at NewSpec": {
-			mk: func() (*Spec, error) {
-				return NewSpec("/bin/echo", []string{"a\x00b"}, []string{}, "")
+		"error: NUL byte rejected at NewRunner": {
+			mk: func() (*Runner, error) {
+				return NewRunner("/bin/echo", []string{"a\x00b"}, []string{}, "")
 			},
 			wantNew:   true,
 			wantErrno: syscall.EINVAL,
 		},
 		"error: exec failure surfaces errno from Run": {
-			mk: func() (*Spec, error) {
-				return NewSpec("/nonexistent/fastexec/binary", nil, []string{}, "")
+			mk: func() (*Runner, error) {
+				return NewRunner("/nonexistent/fastexec/binary", nil, []string{}, "")
 			},
 			wantErrno: syscall.ENOENT,
 		},
@@ -204,15 +204,15 @@ func TestSpecErrors(t *testing.T) {
 			s, err := tt.mk()
 			if tt.wantNew {
 				if err == nil {
-					t.Fatal("NewSpec() succeeded, want error")
+					t.Fatal("NewRunner() succeeded, want error")
 				}
 				if tt.wantErrno != 0 && !errors.Is(err, tt.wantErrno) {
-					t.Fatalf("NewSpec() = %v, want %v", err, tt.wantErrno)
+					t.Fatalf("NewRunner() = %v, want %v", err, tt.wantErrno)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("NewSpec() failed: %v", err)
+				t.Fatalf("NewRunner() failed: %v", err)
 			}
 			var ps ProcessState
 			err = s.Run(nil, nil, nil, &ps)
@@ -227,17 +227,17 @@ func TestSpecErrors(t *testing.T) {
 	}
 }
 
-// TestSpecMarshalingEquivalence proves the frozen arena is
+// TestRunnerMarshalingEquivalence proves the frozen arena is
 // byte-identical to what the per-spawn Cmd path would marshal for the
 // same command, so the two paths hand the kernel the same image.
-func TestSpecMarshalingEquivalence(t *testing.T) {
+func TestRunnerMarshalingEquivalence(t *testing.T) {
 	t.Parallel()
 
 	argv := []string{"a", "b c", ""}
 	env := []string{"K=V", "EMPTY="}
-	s, err := NewSpec("/bin/echo", argv, env, "/tmp")
+	s, err := NewRunner("/bin/echo", argv, env, "/tmp")
 	if err != nil {
-		t.Fatalf("NewSpec() failed: %v", err)
+		t.Fatalf("NewRunner() failed: %v", err)
 	}
 
 	var cs cstrs
@@ -245,6 +245,6 @@ func TestSpecMarshalingEquivalence(t *testing.T) {
 		t.Fatal(err)
 	}
 	if diff := gocmp.Diff(string(cs.buf), string(s.cs.buf)); diff != "" {
-		t.Fatalf("arena mismatch (-cmd +spec):\n%s", diff)
+		t.Fatalf("arena mismatch (-cmd +runner):\n%s", diff)
 	}
 }
