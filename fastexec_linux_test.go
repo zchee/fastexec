@@ -18,6 +18,9 @@ package fastexec
 
 import (
 	"errors"
+	"os"
+	"runtime/pprof"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -47,5 +50,70 @@ func TestClearSighandFallbackLatch(t *testing.T) {
 	var errno syscall.Errno
 	if !errors.As(err, &errno) || errno != syscall.ENOENT {
 		t.Fatalf("exec failure on latched mask path = %v, want ENOENT", err)
+	}
+}
+
+// TestSpawnUnderCPUProfile spawns a burst of children while the CPU
+// profiler delivers SIGPROF to the parent, on both the
+// CLONE_CLEAR_SIGHAND fast path and the forced signal-mask fallback. A
+// SIGPROF landing in a pre-execve child would terminate it (SIG_DFL is
+// "profiling timer expired"), so every child exiting 0 is the
+// assertion. Not parallel: it toggles the process-global latch and the
+// profiler.
+func TestSpawnUnderCPUProfile(t *testing.T) {
+	f, err := os.Create(t.TempDir() + "/cpu.pprof")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := pprof.StartCPUProfile(f); err != nil {
+		t.Fatal(err)
+	}
+	defer pprof.StopCPUProfile()
+
+	spawns := 1024
+	if testing.Short() {
+		spawns = 256
+	}
+
+	for _, tt := range []struct {
+		name  string
+		latch bool
+	}{
+		{name: "success: clear-sighand fast path", latch: false},
+		{name: "success: forced signal-mask fallback", latch: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			old := clearSighandUnavailable.Load()
+			clearSighandUnavailable.Store(tt.latch)
+			t.Cleanup(func() { clearSighandUnavailable.Store(old) })
+
+			s, err := NewSpec("/bin/true", nil, []string{}, "")
+			if err != nil {
+				s, err = NewSpec("/usr/bin/true", nil, []string{}, "")
+			}
+			if err != nil {
+				t.Skipf("no `true` binary: %v", err)
+			}
+			const workers = 16
+			var wg sync.WaitGroup
+			errc := make(chan error, workers)
+			for range workers {
+				wg.Go(func() {
+					for range spawns / workers {
+						var ps ProcessState
+						if err := s.Run(nil, nil, nil, &ps); err != nil {
+							errc <- err
+							return
+						}
+					}
+				})
+			}
+			wg.Wait()
+			close(errc)
+			for err := range errc {
+				t.Fatalf("spawn under CPU profiling failed: %v", err)
+			}
+		})
 	}
 }

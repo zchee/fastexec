@@ -19,6 +19,8 @@ package fastexec
 import (
 	"os"
 	"os/exec"
+	"runtime"
+	"strconv"
 	"testing"
 )
 
@@ -119,6 +121,58 @@ func BenchmarkRunParallelFastexec(b *testing.B) {
 			}
 		}
 	})
+}
+
+// ballast allocates FASTEXEC_BENCH_BALLAST_GIB GiB of touched pages so
+// the parent's page-table size is real, demonstrating fastexec's O(1)
+// spawn cost in parent heap size against fork-class spawning. The
+// ballast benchmarks are skipped unless that variable is set.
+func ballast(b *testing.B) []byte {
+	b.Helper()
+	gib := os.Getenv("FASTEXEC_BENCH_BALLAST_GIB")
+	if gib == "" {
+		b.Skip("set FASTEXEC_BENCH_BALLAST_GIB to run large-heap benchmarks")
+	}
+	n, err := strconv.Atoi(gib)
+	if err != nil || n <= 0 {
+		b.Fatalf("invalid FASTEXEC_BENCH_BALLAST_GIB=%q", gib)
+	}
+	bs := make([]byte, uintptr(n)<<30)
+	for i := 0; i < len(bs); i += 4096 {
+		bs[i] = 1
+	}
+	return bs
+}
+
+func BenchmarkRunSpecLargeHeap(b *testing.B) {
+	bs := ballast(b)
+	path := benchTarget(b)
+	s, err := NewSpec(path, nil, benchEnv, "")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		var ps ProcessState
+		if err := s.Run(nil, nil, nil, &ps); err != nil {
+			b.Fatal(err)
+		}
+	}
+	runtime.KeepAlive(bs)
+}
+
+func BenchmarkRunOsExecLargeHeap(b *testing.B) {
+	bs := ballast(b)
+	path := benchTarget(b)
+	b.ReportAllocs()
+	for b.Loop() {
+		c := exec.Command(path)
+		c.Env = benchEnv
+		if err := c.Run(); err != nil {
+			b.Fatal(err)
+		}
+	}
+	runtime.KeepAlive(bs)
 }
 
 func BenchmarkRunParallelOsExec(b *testing.B) {
