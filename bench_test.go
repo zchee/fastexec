@@ -63,6 +63,38 @@ func BenchmarkRunFastexecReset(b *testing.B) {
 	}
 }
 
+func BenchmarkRunSpec(b *testing.B) {
+	path := benchTarget(b)
+	s, err := NewSpec(path, nil, benchEnv, "")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		var ps ProcessState
+		if err := s.Run(nil, nil, nil, &ps); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRunParallelSpec(b *testing.B) {
+	path := benchTarget(b)
+	s, err := NewSpec(path, nil, benchEnv, "")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			var ps ProcessState
+			if err := s.Run(nil, nil, nil, &ps); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func BenchmarkRunOsExec(b *testing.B) {
 	path := benchTarget(b)
 	b.ReportAllocs()

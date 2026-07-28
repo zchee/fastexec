@@ -193,42 +193,58 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) error {
 	if err != nil {
 		return &Error{Name: c.Path, Err: err}
 	}
-
-	// Stdio sources already at fd >= 3 (the /dev/null singleton, os.Pipe
-	// ends, any normal file) are handed to the child as-is: the child's
-	// dup3(src, 0..2) cannot collide because every source sits above the
-	// target range. Non-CLOEXEC sources then appear in the child at their
-	// original number, exactly as with os/exec. Only sources at fds 0-2
-	// (a caller passing os.Stdin et al) are duplicated up to >= 3 with
-	// O_CLOEXEC set atomically, keeping the dup3 sequence collision-free;
-	// those temporary descriptors close themselves at execve.
-	var highs [3]int
-	var dupped [3]bool
-	for i, f := range files {
-		fd := f.Fd()
-		if fd >= 3 {
-			highs[i] = int(fd)
-			continue
-		}
-		h, ferr := unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 3)
-		if ferr != nil {
-			for j, d := range highs[:i] {
-				if dupped[j] {
-					unix.Close(d)
-				}
-			}
-			return &Error{Name: c.Path, Err: os.NewSyscallError("fcntl", ferr)}
-		}
-		highs[i] = h
-		dupped[i] = true
+	pid, pidfd, err := spawn1(st, c.Path, pathp, dirp, argvp, envp, files, usePipe)
+	if err != nil {
+		return err
 	}
-	defer func() {
-		for i, d := range highs {
-			if dupped[i] {
-				unix.Close(d)
-			}
-		}
-	}()
+	c.Process.Pid = pid
+	c.Process.pidfd = pidfd
+	return nil
+}
+
+// spawnSpec spawns the frozen s. The pooled spawnState contributes
+// only its child stack and clone bookkeeping; the Spec's retained
+// arena supplies every pointer handed to the kernel.
+func spawnSpec(s *Spec, files [3]*os.File) (pid, pidfd int, err error) {
+	st := spawnPool.Get().(*spawnState)
+	defer spawnPool.Put(st)
+	pid, pidfd, err = spawn1(st, s.path, s.pathp, s.dirp, s.argvp, s.envp, files, errnoViaPipe())
+	runtime.KeepAlive(s)
+	return pid, pidfd, err
+}
+
+// startSpec spawns the frozen s, filling in p.
+func startSpec(s *Spec, files [3]*os.File, p *Process) error {
+	pid, pidfd, err := spawnSpec(s, files)
+	if err != nil {
+		return err
+	}
+	p.Pid = pid
+	p.pidfd = pidfd
+	return nil
+}
+
+// runSpec spawns the frozen s and reaps it inline on the pidfd,
+// avoiding the Process handle so the whole cycle is allocation-free.
+func runSpec(s *Spec, files [3]*os.File, ps *ProcessState) error {
+	_, pidfd, err := spawnSpec(s, files)
+	if err != nil {
+		return err
+	}
+	err = waitPidfd(pidfd, ps)
+	unix.Close(pidfd)
+	return err
+}
+
+// spawn1 wires stdio, sets up the optional error pipe, issues the
+// clone through rawSpawn, and maps failures; it is the spawn core
+// shared by the Cmd and Spec paths.
+func spawn1(st *spawnState, name string, pathp, dirp *byte, argvp, envp **byte, files [3]*os.File, usePipe bool) (pid, pidfd int, err error) {
+	highs, dupped, perr := prepStdio(files)
+	if perr != nil {
+		return 0, 0, &Error{Name: name, Err: perr}
+	}
+	defer closeDupped(highs, dupped)
 
 	// In pipe mode, the child reports exec failure by writing the errno
 	// through a CLOEXEC pipe; success is signaled by EOF when execve
@@ -238,7 +254,7 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) error {
 	if usePipe {
 		var pfd [2]int
 		if perr := unix.Pipe2(pfd[:], unix.O_CLOEXEC); perr != nil {
-			return &Error{Name: c.Path, Err: os.NewSyscallError("pipe2", perr)}
+			return 0, 0, &Error{Name: name, Err: os.NewSyscallError("pipe2", perr)}
 		}
 		pipeR, pipeW = pfd[0], pfd[1]
 		if pipeW < 3 {
@@ -246,7 +262,7 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) error {
 			unix.Close(pipeW)
 			if perr != nil {
 				unix.Close(pipeR)
-				return &Error{Name: c.Path, Err: os.NewSyscallError("fcntl", perr)}
+				return 0, 0, &Error{Name: name, Err: os.NewSyscallError("fcntl", perr)}
 			}
 			pipeW = nfd
 		}
@@ -262,7 +278,7 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) error {
 	if usePipe {
 		st.child.pipefd = uint64(pipeW)
 	}
-	pid, errno := rawSpawn(st)
+	rawPid, errno := rawSpawn(st)
 	runtime.KeepAlive(files)
 	if errno != 0 {
 		if usePipe {
@@ -270,9 +286,9 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) error {
 			unix.Close(pipeW)
 		}
 		if errno == unix.ENOSYS || errno == unix.EINVAL {
-			return &Error{Name: c.Path, Err: errors.New("clone3/clone(CLONE_PIDFD) unavailable: fastexec requires Linux 5.4+ and a seccomp policy permitting them")}
+			return 0, 0, &Error{Name: name, Err: errors.New("clone3/clone(CLONE_PIDFD) unavailable: fastexec requires Linux 5.4+ and a seccomp policy permitting them")}
 		}
-		return &Error{Name: c.Path, Err: os.NewSyscallError("clone", errno)}
+		return 0, 0, &Error{Name: name, Err: os.NewSyscallError("clone", errno)}
 	}
 
 	if usePipe {
@@ -282,19 +298,24 @@ func startProcess1(c *Cmd, files [3]*os.File, usePipe bool) error {
 		if childErrno != 0 {
 			reapAbandoned(int(st.pidfd))
 			unix.Close(int(st.pidfd))
-			return &Error{Name: c.Path, Err: childErrno}
+			return 0, 0, &Error{Name: name, Err: childErrno}
 		}
 	} else if st.child.errno != 0 {
 		// The child failed before or at execve and has already exited;
 		// reap it so no zombie is left behind.
 		reapAbandoned(int(st.pidfd))
 		unix.Close(int(st.pidfd))
-		return &Error{Name: c.Path, Err: unix.Errno(st.child.errno)}
+		return 0, 0, &Error{Name: name, Err: unix.Errno(st.child.errno)}
 	}
-	c.Process.Pid = int(pid)
-	c.Process.pidfd = int(st.pidfd)
-	return nil
+	return int(rawPid), int(st.pidfd), nil
 }
+
+// specOS is empty on Linux: a Spec needs no OS-specific frozen state
+// beyond the shared arena.
+type specOS struct{}
+
+// freeze is a no-op on Linux.
+func (s *Spec) freeze() error { return nil }
 
 // rawSpawn issues the clone3(2)/clone(2) call described by st.child and
 // st.stack, handling the CLONE_CLEAR_SIGHAND and clone3 availability
@@ -487,12 +508,13 @@ func (si *siginfo) waitStatus() unix.WaitStatus {
 	}
 }
 
-// wait blocks until the process exits, storing its final state into
-// ps. It waits on the pidfd, so it never races with PID reuse.
-func (p *Process) wait(ps *ProcessState) error {
+// waitPidfd blocks in waitid(P_PIDFD) until the process behind pidfd
+// exits, storing its final state into ps. Waiting on the pidfd never
+// races with PID reuse.
+func waitPidfd(pidfd int, ps *ProcessState) error {
 	var si siginfo
 	for {
-		_, _, e := unix.Syscall6(unix.SYS_WAITID, unix.P_PIDFD, uintptr(p.pidfd),
+		_, _, e := unix.Syscall6(unix.SYS_WAITID, unix.P_PIDFD, uintptr(pidfd),
 			uintptr(unsafe.Pointer(&si)), uintptr(unix.WEXITED),
 			uintptr(unsafe.Pointer(&ps.rusage)), 0)
 		if e == 0 {
@@ -505,6 +527,11 @@ func (p *Process) wait(ps *ProcessState) error {
 	ps.pid = int(si.pid)
 	ps.status = si.waitStatus()
 	return nil
+}
+
+// wait blocks until the process exits, storing its final state into ps.
+func (p *Process) wait(ps *ProcessState) error {
+	return waitPidfd(p.pidfd, ps)
 }
 
 // Signal sends sig to the process through its pidfd.

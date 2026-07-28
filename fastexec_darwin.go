@@ -186,53 +186,97 @@ func startProcess(c *Cmd, files [3]*os.File) error {
 	if err != nil {
 		return &Error{Name: c.Path, Err: err}
 	}
-
-	// Stdio sources already at fd >= 3 (the /dev/null singleton, os.Pipe
-	// ends, any normal file) feed the dup2 file actions as-is: with every
-	// source above the target range 0..2 the actions cannot collide, and
-	// POSIX_SPAWN_CLOEXEC_DEFAULT still closes everything that was not
-	// explicitly mapped. Only sources at fds 0-2 (a caller passing
-	// [os.Stdin] et al) are duplicated up to >= 3 with O_CLOEXEC set
-	// atomically, keeping the actions collision-free.
-	var highs [3]int
-	var dupped [3]bool
-	for i, f := range files {
-		fd := f.Fd()
-		if fd >= 3 {
-			highs[i] = int(fd)
-			continue
-		}
-		h, ferr := unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 3)
-		if ferr != nil {
-			for j, d := range highs[:i] {
-				if dupped[j] {
-					unix.Close(d)
-				}
-			}
-			return &Error{Name: c.Path, Err: os.NewSyscallError("fcntl", ferr)}
-		}
-		highs[i] = h
-		dupped[i] = true
+	pid, err := spawn1(st, c.Path, pathp, dirp, argvp, envp, files)
+	if err != nil {
+		return err
 	}
-	defer func() {
-		for i, d := range highs {
-			if dupped[i] {
-				unix.Close(d)
-			}
-		}
-	}()
+	c.Process.Pid = pid
+	return nil
+}
 
+// spawnSpec spawns the frozen s. With all-nil stdio (every stream
+// resolved to the /dev/null singleton) the file actions frozen at
+// NewSpec are used and the spawn is a single posix_spawn libc call;
+// otherwise the general per-spawn file-actions path runs.
+func spawnSpec(s *Spec, files [3]*os.File) (int, error) {
+	st := spawnPool.Get().(*spawnState)
+	defer spawnPool.Put(st)
+	if st.attrErr != 0 {
+		return 0, &Error{Name: s.path, Err: os.NewSyscallError("posix_spawnattr_init", st.attrErr)}
+	}
+
+	null, err := devNull()
+	if err != nil {
+		return 0, &Error{Name: s.path, Err: err}
+	}
+	if files[0] == null && files[1] == null && files[2] == null {
+		st.pid = 0
+		e := libcCall(
+			libc_posix_spawn_trampoline_addr,
+			uintptr(unsafe.Pointer(&st.pid)), uintptr(unsafe.Pointer(s.pathp)),
+			uintptr(unsafe.Pointer(&s.os.nullFacts)), uintptr(unsafe.Pointer(&st.attr)),
+			uintptr(unsafe.Pointer(s.argvp)), uintptr(unsafe.Pointer(s.envp)),
+		)
+		runtime.KeepAlive(s)
+		if e != 0 {
+			return 0, &Error{Name: s.path, Err: e}
+		}
+		return int(st.pid), nil
+	}
+	pid, err := spawn1(st, s.path, s.pathp, s.dirp, s.argvp, s.envp, files)
+	runtime.KeepAlive(s)
+	return pid, err
+}
+
+// startSpec spawns the frozen s, filling in p.
+func startSpec(s *Spec, files [3]*os.File, p *Process) error {
+	pid, err := spawnSpec(s, files)
+	if err != nil {
+		return err
+	}
+	p.Pid = pid
+	return nil
+}
+
+// runSpec spawns the frozen s and reaps it inline, avoiding the
+// Process handle so the whole cycle is allocation-free.
+func runSpec(s *Spec, files [3]*os.File, ps *ProcessState) error {
+	pid, err := spawnSpec(s, files)
+	if err != nil {
+		return err
+	}
+	ps.pid = pid
+	for {
+		if _, err := unix.Wait4(pid, &ps.status, 0, &ps.rusage); err == nil {
+			break
+		} else if err != unix.EINTR {
+			return os.NewSyscallError("wait4", err)
+		}
+	}
+	return nil
+}
+
+// spawn1 wires stdio into per-spawn file actions and issues the
+// posix_spawn; it is the spawn core shared by the Cmd and the
+// non-frozen Spec paths.
+func spawn1(st *spawnState, name string, pathp, dirp *byte, argvp, envp **byte, files [3]*os.File) (int, error) {
 	// The pooled attribute already carries SETSIGDEF, SETSIGMASK, and
 	// CLOEXEC_DEFAULT; only the per-spawn file actions are built here.
 	if st.attrErr != 0 {
-		return &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawnattr_init", st.attrErr)}
+		return 0, &Error{Name: name, Err: os.NewSyscallError("posix_spawnattr_init", st.attrErr)}
 	}
+
+	highs, dupped, err := prepStdio(files)
+	if err != nil {
+		return 0, &Error{Name: name, Err: err}
+	}
+	defer closeDupped(highs, dupped)
 
 	st.facts = 0
 	if e := libcCallRaw(
 		libc_posix_spawn_file_actions_init_trampoline_addr,
 		uintptr(unsafe.Pointer(&st.facts)), 0, 0, 0, 0, 0); e != 0 {
-		return &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_init", e)}
+		return 0, &Error{Name: name, Err: os.NewSyscallError("posix_spawn_file_actions_init", e)}
 	}
 	defer libcCallRaw(
 		libc_posix_spawn_file_actions_destroy_trampoline_addr,
@@ -242,14 +286,14 @@ func startProcess(c *Cmd, files [3]*os.File) error {
 		if e := libcCallRaw(
 			libc_posix_spawn_file_actions_adddup2_trampoline_addr,
 			uintptr(unsafe.Pointer(&st.facts)), uintptr(h), uintptr(i), 0, 0, 0); e != 0 {
-			return &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_adddup2", e)}
+			return 0, &Error{Name: name, Err: os.NewSyscallError("posix_spawn_file_actions_adddup2", e)}
 		}
 	}
 	if dirp != nil {
 		if e := libcCallRaw(
 			libc_posix_spawn_file_actions_addchdir_np_trampoline_addr,
 			uintptr(unsafe.Pointer(&st.facts)), uintptr(unsafe.Pointer(dirp)), 0, 0, 0, 0); e != 0 {
-			return &Error{Name: c.Path, Err: os.NewSyscallError("posix_spawn_file_actions_addchdir_np", e)}
+			return 0, &Error{Name: name, Err: os.NewSyscallError("posix_spawn_file_actions_addchdir_np", e)}
 		}
 	}
 
@@ -263,10 +307,65 @@ func startProcess(c *Cmd, files [3]*os.File) error {
 	runtime.KeepAlive(st)
 	runtime.KeepAlive(files)
 	if e != 0 {
-		return &Error{Name: c.Path, Err: e}
+		return 0, &Error{Name: name, Err: e}
 	}
-	c.Process.Pid = int(st.pid)
+	return int(st.pid), nil
+}
+
+// specOS carries the Darwin-specific frozen state of a Spec: a
+// file-actions object prebuilt for the all-/dev/null stdio case (plus
+// the frozen chdir, if any), so that path spawns with one libc call.
+type specOS struct {
+	nullFacts uintptr
+}
+
+// freeze prebuilds the nil-stdio file actions. The C allocation is
+// destroyed by a runtime.AddCleanup when the Spec is collected;
+// posix_spawn only reads the object, so concurrent spawns may share it.
+func (s *Spec) freeze() error {
+	null, err := devNull()
+	if err != nil {
+		return &Error{Name: s.path, Err: err}
+	}
+	nfd := uintptr(null.Fd())
+	if e := libcCallRaw(
+		libc_posix_spawn_file_actions_init_trampoline_addr,
+		uintptr(unsafe.Pointer(&s.os.nullFacts)), 0, 0, 0, 0, 0); e != 0 {
+		return &Error{Name: s.path, Err: os.NewSyscallError("posix_spawn_file_actions_init", e)}
+	}
+	for i := range uintptr(3) {
+		if e := libcCallRaw(
+			libc_posix_spawn_file_actions_adddup2_trampoline_addr,
+			uintptr(unsafe.Pointer(&s.os.nullFacts)), nfd, i, 0, 0, 0); e != 0 {
+			s.destroyNullFacts()
+			return &Error{Name: s.path, Err: os.NewSyscallError("posix_spawn_file_actions_adddup2", e)}
+		}
+	}
+	if s.dirp != nil {
+		// addchdir_np copies the path string, so the arena pointer need
+		// not outlive this call.
+		if e := libcCallRaw(
+			libc_posix_spawn_file_actions_addchdir_np_trampoline_addr,
+			uintptr(unsafe.Pointer(&s.os.nullFacts)), uintptr(unsafe.Pointer(s.dirp)), 0, 0, 0, 0); e != 0 {
+			s.destroyNullFacts()
+			return &Error{Name: s.path, Err: os.NewSyscallError("posix_spawn_file_actions_addchdir_np", e)}
+		}
+	}
+	runtime.AddCleanup(s, func(facts uintptr) {
+		libcCallRaw(
+			libc_posix_spawn_file_actions_destroy_trampoline_addr,
+			uintptr(unsafe.Pointer(&facts)), 0, 0, 0, 0, 0)
+	}, s.os.nullFacts)
 	return nil
+}
+
+// destroyNullFacts releases a partially built frozen file-actions
+// object on the NewSpec error path.
+func (s *Spec) destroyNullFacts() {
+	libcCallRaw(
+		libc_posix_spawn_file_actions_destroy_trampoline_addr,
+		uintptr(unsafe.Pointer(&s.os.nullFacts)), 0, 0, 0, 0, 0)
+	s.os.nullFacts = 0
 }
 
 // Process represents a running process created by [Cmd.Start].

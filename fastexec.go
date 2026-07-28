@@ -318,6 +318,42 @@ var devNull = sync.OnceValues(func() (*os.File, error) {
 	return os.OpenFile(os.DevNull, os.O_RDWR, 0)
 })
 
+// prepStdio hands stdio sources already at fd >= 3 (the /dev/null
+// singleton, os.Pipe ends, any normal file) to the child as-is: with
+// every source above the target range 0..2, the child-side dup2/dup3
+// wiring cannot collide by construction. Only sources at fds 0-2 (a
+// caller passing os.Stdin et al) are duplicated up to >= 3 with
+// O_CLOEXEC set atomically; closeDupped releases those temporaries.
+// Non-CLOEXEC sources appear in the child at their original number on
+// Linux, exactly as with os/exec, while Darwin's CLOEXEC_DEFAULT still
+// closes everything that was not explicitly mapped.
+func prepStdio(files [3]*os.File) (highs [3]int, dupped [3]bool, err error) {
+	for i, f := range files {
+		fd := f.Fd()
+		if fd >= 3 {
+			highs[i] = int(fd)
+			continue
+		}
+		h, ferr := unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 3)
+		if ferr != nil {
+			closeDupped(highs, dupped)
+			return highs, dupped, os.NewSyscallError("fcntl", ferr)
+		}
+		highs[i] = h
+		dupped[i] = true
+	}
+	return highs, dupped, nil
+}
+
+// closeDupped closes the descriptors prepStdio duplicated up.
+func closeDupped(highs [3]int, dupped [3]bool) {
+	for i, d := range highs {
+		if dupped[i] {
+			unix.Close(d)
+		}
+	}
+}
+
 // envCache holds the snapshot of the process environment used for
 // commands whose Env is nil, so steady-state nil-Env spawning does not
 // re-copy the environment on every spawn.
@@ -448,6 +484,23 @@ func (c *Cmd) Reset() {
 	c.ctxKill.Store(false)
 	c.Process.reset()
 	c.ProcessState = ProcessState{}
+}
+
+// Wait blocks until the process exits, stores its final state into ps,
+// and releases the process handle. It returns an [*ExitError] if the
+// process exited unsuccessfully. Wait must be called exactly once per
+// started process; it is used with [Spec.Start], while [Cmd.Wait]
+// wraps it with the Cmd bookkeeping.
+func (p *Process) Wait(ps *ProcessState) error {
+	err := p.wait(ps)
+	p.release()
+	if err != nil {
+		return err
+	}
+	if !ps.Success() {
+		return &ExitError{ProcessState: *ps}
+	}
+	return nil
 }
 
 // Run starts the specified command and waits for it to complete.
